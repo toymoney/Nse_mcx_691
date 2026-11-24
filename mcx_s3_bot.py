@@ -19,8 +19,8 @@ from mcx_recorder import Recorder
 IST = ZoneInfo('Asia/Kolkata')
 MASTER_URL = 'https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz'
 VERSION = 'MCX_S3_RESEARCH_V1'
-ALERT_POLICY = 'MCX_OPTIONS_BUY_GAP15_LIQUID_ATM4_V3'
-ALERT_FILTERS = {'min_gap_pct':15., 'max_spread_pct':2., 'min_oi_raw':500.,
+ALERT_POLICY = 'MCX_OPTIONS_BUY_GAP2_5_PEERMID_ATM4_V4'
+ALERT_FILTERS = {'min_gap_pct':2., 'max_gap_pct':5., 'max_spread_pct':2., 'min_oi_raw':500.,
                  'min_volume_raw':100., 'max_trade_age_seconds':30., 'max_atm_steps':4}
 
 
@@ -209,9 +209,10 @@ def snapshot(row, quote, observed, future=None, broker=None):
 
 
 def evaluate(rows, t, rate=.06):
-    """No OI/volume/spread/depth/delta/IV/gap thresholds. Own IV excluded from fair value."""
+    """Record own LTP IV; price targets only from liquid, fresh adjacent peer midpoints."""
     groups = defaultdict(list)
     for r in rows:
+        r.update(model_target=None, peer_iv_pct=None, gap_pct=None, ask_gap_pct=None, peer_keys=[], peer_input_checks=[])
         fq = r.get('future_quote_raw') or {}; f = number(fq.get('last_price'))
         ft = timestamp(fq.get('last_trade_time')); ot = timestamp(r.get('last_trade_at'))
         end = timestamp(r['expiry_at']); years = (end-t).total_seconds()/(365*86400)
@@ -233,8 +234,21 @@ def evaluate(rows, t, rate=.06):
             if index==0 or index==len(group)-1:
                 r['model_status']='missing_bracketing_peer_iv'; continue
             left, right = group[index-1], group[index+1]
+            checks=[]; peer_vols=[]
+            for peer in (left,right):
+                reasons=liquidity_reasons(peer)
+                bid=number(peer.get('bid')); ask=number(peer.get('ask'))
+                mid=(bid+ask)/2 if bid and ask and bid<=ask else None
+                iv=implied_vol(mid,r['futures_price'],peer['strike'],r['years'],r['side'],rate) if mid else None
+                if iv is None: reasons.append('midpoint_iv_not_solvable')
+                checks.append({'instrument_key':peer['instrument_key'],'reasons':reasons,'midpoint':mid,'midpoint_iv_pct':iv*100 if iv else None})
+                peer_vols.append(iv)
+            r['peer_input_checks']=checks
+            r['peer_keys']=[left['instrument_key'],right['instrument_key']]
+            if any(c['reasons'] for c in checks):
+                r['model_status']='peer_liquidity_or_freshness_failed'; continue
             weight = (r['strike']-left['strike'])/(right['strike']-left['strike'])
-            vol = (left['own_iv_pct']*(1-weight)+right['own_iv_pct']*weight)/100
+            vol = peer_vols[0]*(1-weight)+peer_vols[1]*weight
             fair = black76(r['futures_price'],r['strike'],r['years'],vol,r['side'],rate)
             r.update(model_target=fair, peer_iv_pct=vol*100, model_status='computed',
                      peer_keys=[left['instrument_key'],right['instrument_key']],
@@ -258,24 +272,15 @@ def annotate_atm(rows):
     return rows
 
 
-def alert_reasons(r):
+def liquidity_reasons(r):
     reasons=[]
-    target=number(r.get('model_target'));ltp=number(r.get('ltp'))
     ask=number(r.get('ask'));bid=number(r.get('bid'))
-    if r.get('model_status')!='computed' or not target or target<=0:
-        reasons.append('model_unavailable')
-    if ltp is None or ltp<=0:reasons.append('invalid_ltp')
     if bid is None or ask is None or min(bid,ask)<=0:
         reasons.append('missing_positive_book')
     elif bid>ask:reasons.append('crossed_book')
     else:
         spread=100*(ask-bid)/((ask+bid)/2)
         if spread>ALERT_FILTERS['max_spread_pct']+1e-12:reasons.append('spread_above_2pct')
-    if target and target>0:
-        if ltp is not None and (target-ltp)/target*100<ALERT_FILTERS['min_gap_pct']-1e-12:
-            reasons.append('ltp_gap_below_15pct')
-        if ask is not None and (target-ask)/target*100<ALERT_FILTERS['min_gap_pct']-1e-12:
-            reasons.append('ask_gap_below_15pct')
     for field,minimum,label in [('oi_raw',ALERT_FILTERS['min_oi_raw'],'oi_below_500'),
                                 ('volume_raw',ALERT_FILTERS['min_volume_raw'],'volume_below_100')]:
         value=number(r.get(field))
@@ -286,6 +291,21 @@ def alert_reasons(r):
     for field in ('bid_qty_raw','ask_qty_raw'):
         quantity=number(r.get(field))
         if quantity is None or quantity<=0:reasons.append('missing_'+field)
+    return reasons
+
+
+def alert_reasons(r):
+    reasons=liquidity_reasons(r)
+    target=number(r.get('model_target'));ltp=number(r.get('ltp'));ask=number(r.get('ask'))
+    if r.get('model_status')!='computed' or not target or target<=0:
+        reasons.append('model_unavailable')
+    if ltp is None or ltp<=0:reasons.append('invalid_ltp')
+    if target and target>0:
+        for label,value in [('ltp',ltp),('ask',ask)]:
+            if value is None:continue
+            gap=100*(target-value)/target
+            if gap<ALERT_FILTERS['min_gap_pct']-1e-12:reasons.append(label+'_gap_below_2pct')
+            if gap>ALERT_FILTERS['max_gap_pct']+1e-12:reasons.append(label+'_gap_above_5pct')
     steps=number(r.get('strike_steps_from_atm'))
     if steps is None or abs(steps)>ALERT_FILTERS['max_atm_steps']:
         reasons.append('outside_atm_plus_minus_4_or_unknown')
@@ -352,7 +372,7 @@ class Scanner:
             d=self.state['days'].setdefault(day,{'date':day,'sweeps':0,'counts':{},'reported':False})
             self.counts=Counter(d.get('counts',{}))
             d.update(alert_policy=ALERT_POLICY,alert_filters=ALERT_FILTERS,option_count=len(self.options),future_count=len(self.futures),discovery_skips=skipped)
-            self.emit('online-'+ALERT_POLICY+'-'+day,f'MCX S3 ONLINE | {day}\nOption buying only; minimum 15% gap at both LTP and ask; ATM ±4 only. Spread <=2%; OI >=500; volume >=100 (broker raw units); last trade <=30s. Recording all strikes, nearest expiry, '+', '.join(sorted({r['underlying_symbol'] for r in self.options}))+f'.\n{len(self.options)} options; raw snapshot recording ON.\n15%+ option-gap watches once per contract per day; all snapshots retained. Close {close_time(day):%H:%M} IST.')
+            self.emit('online-'+ALERT_POLICY+'-'+day,f'MCX S3 ONLINE | {day}\nOption buying only; 2–5% gap at both LTP and ask; targets use fresh, liquid neighbour bid–ask midpoint IV; ATM ±4 only. Spread <=2%; OI >=500; volume >=100 (broker raw units); last trade <=30s. Recording all strikes, nearest expiry, '+', '.join(sorted({r['underlying_symbol'] for r in self.options}))+f'.\n{len(self.options)} options; raw snapshot recording ON.\n2–5% option-gap watches once per contract per day; all snapshots retained. Close {close_time(day):%H:%M} IST.')
         return self.state['days'][day]
 
     def report(self,day):
@@ -367,7 +387,7 @@ class Scanner:
                 'evidence':'Same-day post-entry polled LTP only. No full-tick or complete candle coverage claimed.'}
         folder=self.root/'reports';folder.mkdir(exist_ok=True)
         (folder/(day+'.json')).write_text(json.dumps(report,indent=2))
-        text=f'MCX S3 DAILY | {day}\nSweeps {d["sweeps"]}; options {d["option_count"]}\n15%+ option watches {len(cohort)}; target observed {counts["TARGET_OBSERVED"]}; no touch observed {counts["NO_TOUCH_OBSERVED"]}.\nAll raw snapshots saved, including contracts without a model/watch.\nPolled observations; use recorded data for filter comparison.'
+        text=f'MCX S3 DAILY | {day}\nSweeps {d["sweeps"]}; options {d["option_count"]}\n2–5% option watches {len(cohort)}; target observed {counts["TARGET_OBSERVED"]}; no touch observed {counts["NO_TOUCH_OBSERVED"]}.\nAll raw snapshots saved, including contracts without a model/watch.\nPolled observations; use recorded data for filter comparison.'
         (folder/(day+'.txt')).write_text(text);self.emit('report-'+day,text)
         d['reported']=True; self.save()
 
