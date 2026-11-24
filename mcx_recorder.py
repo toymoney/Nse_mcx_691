@@ -54,7 +54,7 @@ def records(path):
 
 def flatten(row):
     result = {k: v for k, v in row.items() if not isinstance(v, (list, dict))}
-    for name in ('quality_flags','peer_keys'):
+    for name in ('quality_flags','peer_keys','alert_rejection_reasons'):
         if name in row: result[name]=json.dumps(row[name],separators=(',',':'))
     for name in ('broker_greeks', 'model_greeks'):
         for k, v in (row.get(name) or {}).items():
@@ -124,3 +124,4 @@ def main():
     else: print(json.dumps(analyse(args.source, args.output)))
 
 if __name__ == '__main__': main()
+

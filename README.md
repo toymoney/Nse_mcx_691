@@ -1,147 +1,149 @@
-# MCX S3 research scanner + complete snapshot recorder
+# MCX S3 v3 — option buying + complete research recording
 
-Separate MCX project. Keep the existing NSE scanner running in its own repository.
+This package updates the existing MCX scanner. It does not change NSE files or place orders.
 
-## What is included
+## Update your existing repository
 
-- `mcx_s3_bot.py`: discovers contracts, fetches full quotes and broker Greeks where available, calculates Black-76 IV/Greeks and peer-IV model values, sends Telegram model watches and target-observed updates.
-- `mcx_recorder.py`: separate recording module and standalone record/export/analyse commands. Saves every selected option snapshot, including no-model and no-alert records. It is automatically used by the scanner: do not run a second recorder concurrently against the same state directory.
-- `.github/workflows/mcx_s3.yml`: session schedules, tests, persistent MCX data branch and downloadable Actions data artifacts.
-- `tests/test_mcx.py`, `requirements.txt`, `.gitignore` and this guide.
+1. Stop any active MCX scanner job.
+2. Extract the ZIP. Replace these exact paths on your repository's default branch:
+   - `mcx_s3_bot.py`
+   - `mcx_recorder.py`
+   - `tests/test_mcx.py` (inside the tests folder)
+   - `README.md`
+3. Commit them together. The corrected tests must be uploaded with the scanner.
+4. Open Actions > MCX S3 scanner and recorder > Run workflow > mode `run`.
 
-Telegram option-buy alerts require at least a 15% model-relative gap at both LTP and the available ask price. There are no additional OI, volume, volume/OI, spread, depth, delta, IV or trade-age thresholds. All snapshots remain unfiltered. No ATM-only restriction and no five-day rollover. There are no order/trade execution endpoints.
+The existing workflow and all three secrets are unchanged. This ZIP also includes the workflow and requirements for a fresh installation. Do not delete `mcx-research-state` or any existing recordings. The ZIP is a replacement package for you to upload; the connected GitHub repository was only read while preparing it.
 
-Scope is all listed CE/PE strikes of the nearest active option expiry for CRUDEOIL, NATURALGAS, GOLD and SILVER. These are separate contract families; mini/micro variants are not silently substituted. Actual futures mapping uses the option's exact `underlying_key` from the master. We skip unmapped/expired contracts instead of guessing. Nearest expiry is a data-collection scope, not a tested signal filter. Set MCX_SYMBOLS to choose different master symbols; an empty value selects all MCX option symbols (verify their session/expiry specifications first).
+## Live-alert rules
 
-A new BUY-side model watch is made only when both LTP and ask are at least 15% below the computed fixed model target. The instrument being bought is the CE/PE option; the futures price is only a valuation input. One watch per contract per day under the current alert policy prevents repeated Telegram alerts. Snapshot recording continues every sweep for every selected strike regardless of watches or outcomes. There is no active-commodity or CE/PE suppression. DOWN/zero-gap snapshots are saved for research but do not produce buy watches.
+| Rule | Requirement |
+|---|---|
+| Instruments | CRUDEOIL, NATURALGAS, GOLD, SILVER options; nearest active option expiry |
+| Direction | Buy CE or PE; target above purchase reference |
+| Strike | ATM and up to four actual listed strike steps on either side |
+| Gap at LTP | At least 15% below model target |
+| Gap at available ask | At least 15% below model target |
+| Spread | `(ask-bid)/((ask+bid)/2)*100 <= 2%` |
+| OI | >=500 in the broker's raw reported quantity units |
+| Today's volume | >=100 in the broker's raw reported quantity units |
+| Last-trade age | From 0 to 30 seconds inclusive, measured at evaluation |
+| Book validity | Positive bid, ask and displayed quantities; bid <= ask |
 
-## First upload: new GitHub repository
+ATM is calculated from the exact underlying futures price. Ties select the higher strike. The strike-step count uses the complete listed strike set for the same futures contract and option expiry, including strikes whose quotes are missing; removing a quote cannot move the strike indices. Both CE and PE may alert. There is no NSE-style gap-tier OI rule, 30% gap cap, delta limit, IV ceiling, 3-lot depth floor or five-day rollover in this MCX version.
 
-1. Create a separate repository, for example `MCX-S3-Research`.
-2. Extract the ZIP and upload the contents at repository root. Do not upload just the ZIP. Include both Python modules, tests and requirements.
-3. Create the workflow path `.github/workflows/mcx_s3.yml` using **Add file > Create new file** if your upload interface omits hidden folders. Copy the supplied YAML. This is a new workflow; do not replace your NSE workflow with it.
-4. Add the same three repository secrets: `UPSTOX_ACCESS_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. The broker account/token must have usable MCX market-data access. Renew access tokens through the normal Upstox login process when required.
-5. Under **Settings > Actions > General > Workflow permissions**, enable **Read and write permissions**.
-6. Open **Actions > MCX S3 scanner and recorder > Run workflow > mode: test**. It fetches one complete sweep and saves snapshots, sends startup/test status, and creates no new watches. Zero returned MCX option quotes makes the test fail explicitly. Inspect `last_quote_count`, `last_missing_quote_count`, `last_broker_greeks_count` and model-status counts in the data branch's state file. Partial coverage is reported rather than fabricated.
-7. Run **mode: run** for Telegram watches plus recording. **mode: record** records and tracks watches silently without Telegram. `once` performs one sweep with alerts.
-8. Scheduled jobs subsequently run automatically on weekdays while the workflow stays enabled on the default branch.
+Missing, nonfinite or negative required inputs do not pass. OI and volume are deliberately labelled **broker raw units**, not converted NSE-style lots. Master `lot_size` and `qty_multiplier` remain separately recorded so conversions can be verified before changing thresholds. The initial 500/100 thresholds are configurable code constants in `ALERT_FILTERS`, not claimed MCX performance findings.
 
-No extra Telegram IDs, webhook setup or manual price inputs are required. Do not share tokens in chat, code or screenshots. Connection checks here did not use your authenticated quotes or Telegram credentials; use the supplied test mode before relying on live coverage.
+15% is an alert threshold, not a fixed profit target. The gap formula is `(model target - price)/model target`; a model value of 100 permits LTP and ask no higher than 85. Target comes from Black-76 using the mapped future, strike, remaining expiry time, discount rate and same-side neighbouring-strike IV. Candidate own IV is excluded from its target calculation. The target method is unchanged in this release; the new liquidity checks restrict alerts only and do not filter IV peers or raw data collection.
 
-## Where the research data is saved
-
-Switch the GitHub branch selector to **mcx-research-state**:
-
-```
-state.json
-master-YYYY-MM-DD.json.gz
-snapshots/YYYY-MM-DD/HHMM-unique-id.jsonl.gz
-reports/YYYY-MM-DD.json
-reports/YYYY-MM-DD.txt
-```
-
-The workflow checkpoints closed compressed snapshot chunks and state about every five minutes and on normal exit. Each restart writes new uniquely named chunks; it never truncates a prior chunk. State/report data is separate from the NSE state branch. Downloadable **mcx-data-RUN_ID** artifacts appear at the bottom of each Actions run after it finishes, with seven-day artifact retention. Git data is retained without automatic pruning. A large all-strike raw-data archive will grow; archive/manage historical data deliberately as the research period grows. Public repositories make these market snapshots and message texts public. Credentials are not included in snapshots.
-
-Each chunk is gzip-compressed JSON Lines: one independent JSON object per line. Preserve the whole day's folder for later analysis. Do not edit state or snapshots while the scanner job is running. A forced runner termination can lose the most recent uncheckpointed records; the exit step attempts to save them.
-
-## Recorded data
-
-Every selected option produces a record on every sweep, even if the quote is missing or IV cannot be solved. Each record includes:
-
-- Instrument key, commodity, strike, CE/PE, expiry timestamp used, exact underlying futures key, lot size, quantity multiplier and raw tick size.
-- LTP, OI, cumulative volume, volume/OI, best bid and ask, their displayed quantities, spread in price and percent, and full top-five depth and all other broker quote fields under `raw_quote`.
-- Broker quote update timestamp, last-trade timestamp, quote receipt timestamp, evaluation timestamp, trade age and data-quality flags.
-- Full underlying futures quote plus its receipt timestamp. Futures also get independent snapshot records.
-- Unmodified broker Greek response and its separate receipt timestamp, if supplied; calculated Black-76 IV, signed delta, gamma, theta/day, vega/1 percentage-point IV, rho/1 percentage-point rate.
-- Peer IV, peer instrument keys, model target, signed LTP gap and ask-based gap, or a specific reason the model could not be calculated.
-- API batch errors and timestamps as separate error records.
-
-Missing values remain null, never substituted with zero or yesterday's value. MCX API quantity units are preserved as **broker raw**; master lot_size/qty_multiplier are included separately. Do not automatically divide all MCX OI/depth numbers by lot_size as if these were NSE equity quantities. Quantity-unit conversion must be checked against the live MCX response before designing lot-based filters.
-
-Broker Greeks and local calculated Greeks are different fields. The Greeks endpoint is requested in batches of at most 50. If it rejects MCX or becomes unavailable, the error is recorded and local calculations continue; broker fields remain missing. It retries broker Greek capability on the next job. Local IV is solved from each contract's own LTP; own IV is used for local Greeks only. For the candidate's target, own IV is excluded: the nearest usable same-expiry, same-side strikes on both sides supply interpolated peer IV. OI/spread do not weight that interpolation. Edge strikes or insufficient peer data are retained with a model-status reason, not an invented target.
-
-Mathematically impossible prices, nonpositive inputs and missing/different-day trade inputs cannot produce a model value. These are technical validity requirements, not strategy thresholds. Old same-day LTPs, wide spreads and shallow books are recorded and can produce flagged research watches: there is no additional strategy freshness/depth/spread gate; a crossed book cannot produce a new buy alert.
-
-## Observation frequency and outcomes
-
-This is a REST **snapshot** recorder, not an every-tick market-feed archive. The pause after each sweep is 60 seconds by default, plus API fetch, computation, Telegram and checkpoint time. Quotes are batched, not simultaneous. All quote receipt times are retained. A large universe or delayed API extends the interval; sweep timing appears in logs and state.
-
-Targets are fixed when a watch is made. Only a later same-day last trade with a timestamp strictly AFTER entry can confirm a target. Repeated stale quotes cannot manufacture hits. The report uses `TARGET_OBSERVED` or `NO_TOUCH_OBSERVED`; it does not assert full tick/candle coverage. No stop-loss, fees or fill simulation is implemented. Offline analysis labels records with no later data as `NO_LATER_DATA`.
-
-Telegram sends at most five queued messages per loop and prioritises startup/test/report and target updates. The 15% gap threshold reduces Telegram model watches; all are persisted, while Telegram delivery may lag. Each contract alerts once daily; a crash during a successful but unacknowledged Telegram request can cause a duplicate on retry.
-
-## MCX session and persistence
-
-For these four non-agri commodity families, the default scheduled session is 09:00–23:55 IST from 2 November 2026 through 12 March 2027. Outside that published window the default close is 23:30; `MCX_CLOSE=HH:MM` overrides it for a changed/special schedule. There is no 3:20 PM NSE cutoff. New MCX watches may be created up to the configured commodity close; reporting starts two minutes after close. Weekends are excluded. No complete exchange holiday/special-session calendar is bundled; a weekday holiday will retain previous-day quote flags and cannot model those previous-day inputs.
-
-The master often supplies a midnight date marker rather than an authoritative tradable expiry time. Model expiry uses that listed date at the configured MCX close. `EXPIRY_TIMES_JSON` permits per-symbol expiry-time overrides, for example `{"YOUR_SYMBOL":"HH:MM"}` using actual verified contract specifications. The selected close is an explicit configurable modelling assumption, not a claim that all commodity options have identical expiry-day sessions.
-
-Four weekday GitHub starts: 08:50, 13:40, 18:30 and 23:20 IST. Each job runs up to 295 minutes; later jobs queue behind an active job sharing the MCX state branch. GitHub scheduling may be delayed; data gaps are not backfilled as if they were observed. A local continuously running process avoids job handoff gaps but needs a computer left on.
-
-## Local commands
-
-Install Python 3.11+ and `python -m pip install -r requirements.txt`; set the three secrets as environment variables in your own system.
+Example message format:
 
 ```
+BUY MCX OPTION | COMMODITY STRIKE CE/PE
+Expiry: YYYY-MM-DD
+Entry ₹85 | Target ₹100
+Gap below model value at ask: 15.00%
+Stop-loss: not set
+HH:MM:SS IST | Option premium; not a futures trade
+```
+
+Entry is the ask reference at detection, not a claimed executed fill. The future is a pricing input, never an order. A stop-loss has not been invented. Target messages preserve the original target and show observed price separately. There are no order endpoints.
+
+## All data continues recording
+
+The filters do not shrink the recorder universe. All listed CE/PE strikes in the selected nearest expiry are fetched for each selected commodity, including those outside ATM ±4, low-volume options, wide books, stale/missing quotes and invalid-model rows.
+
+Every option snapshot retains:
+
+- Identity, strike, side, expiry, exact future key, lot size, quantity multiplier and raw tick size.
+- Full raw option quote, all returned five-level bid/ask depth, OI, volume, total quantities, OHLC and any other broker quote fields.
+- Best bid/ask and quantities, spread, volume/OI, LTP, trade timestamp, quote timestamp, receipt/evaluation times and age.
+- Raw mapped-future quote and receipt timestamp, with independent future snapshot rows.
+- Original broker Greek response and its receipt time when available. Missing broker Greeks stay null.
+- Local Black-76 IV, signed delta, gamma, theta/day, vega/1 IV percentage point and rho/1 rate percentage point, when computable.
+- Peer IV, peer keys, model target, LTP/ask gaps and model-status reason when the model cannot be calculated.
+- **New:** `atm_strike`, signed `strike_steps_from_atm`, `alert_policy`, `alert_eligible` and the full `alert_rejection_reasons` array.
+- Separate API-error rows with timestamps. Missing values are never invented as zero.
+
+`mcx_recorder.py` is automatically used by `mcx_s3_bot.py`. You do not run two processes for alerts and recording.
+
+## Where to find recorded files
+
+In GitHub open the repository, change the branch selector from `main` to **`mcx-research-state`**, then open:
+
+| Path | Contents |
+|---|---|
+| `snapshots/YYYY-MM-DD/*.jsonl.gz` | All option/future observations and errors |
+| `reports/YYYY-MM-DD.json` | Daily watch records, outcomes and rejection counters |
+| `reports/YYYY-MM-DD.txt` | Readable daily report |
+| `state.json` | Current progress, watches, policies and Telegram queue |
+| `master-YYYY-MM-DD.json.gz` | Instrument master used that day |
+
+For example, recordings on 24 November 2026 are in `snapshots/2026-11-24/`. Download the complete folder, not just one five-minute chunk, for full-day comparisons. The snapshot files are compressed JSON Lines: decompress `.gz`, then each line is a JSON object.
+
+Alternatively, open a completed Actions run and download the **mcx-data-RUN_ID** artifact under Artifacts. It includes state, recordings, master and reports. Artifact retention is seven days; the separate data branch is retained without automatic pruning. Raw all-strike archives accumulate over time and may become large. Credentials are not written to research files; data/message text on a public branch is public.
+
+Every snapshot is retained before alert selection. There is no need for a live alert in order to analyse a rejected opportunity later. CSV export includes the rejection-reason array as a JSON string.
+
+## Restart and compatibility
+
+State format remains compatible. New alert policy is `MCX_OPTIONS_BUY_GAP15_LIQUID_ATM4_V3`. On upgrade, unsent entry/hit messages from previous policies are marked suppressed so old small-gap or illiquid alerts do not drain into Telegram. They are not falsely marked delivered or deleted. Prior watches remain stored and continue target observation silently; report JSON identifies legacy watches separately.
+
+Deduplication is once per contract per day within the new policy. A contract may qualify under this new policy even if an old policy previously created a watch today. Current-policy queued alerts survive subsequent restarts. Existing targets are not rewritten.
+
+## Outcomes and observation scope
+
+This is a REST snapshot recorder, not a complete tick archive. By default, each sweep is followed by a 60-second pause; API, computation, Telegram and checkpoints add to elapsed time. Quote batches are not simultaneous; receipt/evaluation times are preserved.
+
+A watch target is fixed at creation. A hit requires an actual later same-day trade timestamp strictly after entry; a repeated stale pre-entry LTP cannot create a hit. `NO_TOUCH_OBSERVED` means no crossing in collected observations, not complete exchange coverage. Reports describe target observations, not stop-loss/cost/fill results.
+
+Daily counters include repeated per-snapshot rejection reasons (not unique contracts). A row can fail several filters. The report's actual rejection reasons let us see whether spread, OI, volume, age or strike scope is responsible for low alert counts.
+
+The recorder's offline `analyse` command tests every positive-gap model snapshot against later collected prices within that day, independent of alert eligibility. It labels `TARGET_OBSERVED`, `NO_TOUCH_OBSERVED` or `NO_LATER_DATA`. Those rows are research opportunities, not deduplicated live alert counts.
+
+## Schedule and modes
+
+Current default non-agri session is 09:00–23:55 IST during the published 2 November 2026–12 March 2027 window; outside it the close defaults to 23:30. `MCX_CLOSE=HH:MM` overrides changed/special timings. There is no 3:20 PM NSE cutoff. Reporting starts two minutes after configured close. Weekends are excluded; no full exchange holiday/special-session calendar is bundled.
+
+Model expiry uses the master-listed date at configured close. If contract-specific expiry-day timings differ, set verified per-symbol `EXPIRY_TIMES_JSON` overrides. The master often contains a date marker rather than a tradable-session expiry timestamp. The model-rate default is 6% annually (`RISK_FREE_RATE`).
+
+The workflow starts at 08:50, 13:40, 18:30 and 23:20 IST on weekdays. Jobs run up to 295 minutes, queue to protect the data branch, checkpoint about every five minutes and attempt a final save/artifact upload on exit. Scheduling and job handoffs can leave gaps; unobserved data is not fabricated.
+
+| Mode | Telegram | Recording |
+|---|---|---|
+| `run` | Live filtered watches and target/report updates | All snapshots |
+| `record` | Disabled | All snapshots, with filtered watch tracking |
+| `test` | Startup/connection status, no new watches | One sweep |
+| `once` | Filtered watches/updates | One sweep |
+
+For a fresh repository, add `UPSTOX_ACCESS_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` as secrets and enable Settings > Actions > General > Read and write workflow permissions. Include `.github/workflows/mcx_s3.yml`, using Add file > Create new file if your upload interface omits hidden folders. Use a valid Upstox token with MCX data access. The Put/Call Option Chain API is not used for MCX: quotes are assembled by instrument key. Broker Greeks are requested in 50-key batches; if unavailable, the error is saved and local calculations continue.
+
+## Local use and research export
+
+Python 3.11+:
+
+```
+python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
-python mcx_s3_bot.py --mode test
 python mcx_s3_bot.py --mode run
 ```
 
-The separate recorder can run silently:
+Set secrets in your own environment. Local state defaults to `mcx-state/`; Git checkpointing is off unless `GIT_STATE=true`. The separate module's `python mcx_recorder.py record` runs the collector silently without Telegram secrets. Do not run it alongside the scanner in the same state directory.
 
-```
-python mcx_recorder.py record
-```
-
-It uses the same collector/model and does not need Telegram secrets. Do not run `record` alongside the scanner with the same MCX_STATE_DIR.
-
-Download the `mcx-research-state` branch/data artifact and export one day:
+After downloading recorded files, use the actual extracted snapshot path:
 
 ```
 python mcx_recorder.py export --source mcx-state/snapshots/2026-11-24 --output mcx_snapshots.csv
 python mcx_recorder.py analyse --source mcx-state/snapshots/2026-11-24 --output mcx_outcomes.csv
 ```
 
-Use the actual extracted snapshot path. Export writes a flat option table; full raw depth/futures/Greek responses remain in JSONL. `analyse` evaluates every positive-model-gap snapshot against later observed trade prices within the same day. These are snapshot opportunities, not unique live alerts; reports/state hold the deduplicated alert cohort. It does not apply the later NSE filters. These files support testing those thresholds later without losing the unfiltered comparison data.
-
-Optional environment variables:
-
-| Variable | Default | Meaning |
-|---|---|---|
-| MCX_SYMBOLS | CRUDEOIL,NATURALGAS,GOLD,SILVER | Exact option family names |
-| MCX_STATE_DIR | mcx-state locally | Separate persistent directory |
-| SNAPSHOT_INTERVAL_SECONDS | 60 | Pause after each sweep |
-| MAX_RUN_MINUTES | 300 locally; 295 workflow | Maximum process run time |
-| RISK_FREE_RATE | 0.06 | Annual model discount rate |
-| MCX_CLOSE | published-window default | HH:MM session override |
-| EXPIRY_TIMES_JSON | {} | Verified per-symbol expiry time override |
-| GIT_STATE | false locally | Workflow enables git checkpoint/push |
-
 ## Verification
 
-Offline tests cover futures-option mapping, all-strike discovery, expiry selection, Black-76 parity/IV inversion and signed Greeks, absent data, previous-day input handling, own-IV exclusion, Greek request batch limits, recorder restarts, CSV export, post-entry outcomes, deduplication, report labels and a full mocked sweep with broker-Greek fallback. The public MCX master was downloaded successfully; on the development check 1,518 selected options mapped to four exact futures across the four families, with no guessed mappings. Counts and listings change.
+28 offline tests passed. They cover pricing/IV inversion, own-IV exclusion, signed Greeks, exact futures mapping, missing values, complete-list ATM selection and ties, all liquidity boundaries, missing/nonfinite/negative inputs, the 15% ask/LTP checks, recording rejected rows, CSV export, restart/deduplication, post-entry target observation and a mocked collector sweep. Authenticated MCX data/Telegram and GitHub execution were not run using your credentials for this release.
 
-Authenticated MCX quotes/Greeks, Telegram and your GitHub scheduling have not been exercised with your credentials here.
-
-Official references:
+References:
 - https://upstox.com/developer/api-documentation/instruments/
 - https://upstox.com/developer/api-documentation/get-full-market-quote/
 - https://upstox.com/developer/api-documentation/option-greek/
-- https://upstox.com/developer/api-documentation/get-pc-option-chain/ (MCX option-chain endpoint unavailable; this code does not call it)
-- https://www.mcxindia.com/faq/market-operations (Black-76 for options on futures)
+- https://www.mcxindia.com/faq/market-operations
 - https://upstox.com/announcements/revised-timings/
-
-## Option buying: 15% alert restriction update
-
-Only live/paper alert selection changes. Require (model target - LTP)/model target >=0.15 AND (model target - best ask)/model target >=0.15. No upper gap cap. A missing/nonpositive ask or crossed book is not a valid buy reference. Model-relative gap is distinct from return on purchase price: model 100 and ask 85 is a 15% model gap. The futures instrument is NEVER traded; only the option CE/PE is identified.
-
-Messages now say BUY MCX OPTION, specify CALL/PUT, expiry, buy reference (ask), sell target and ask-based gap. No stop-loss is invented; the alert says it is not set. Quote prices are references at the recorded timestamp. No order endpoints exist.
-
-Recorder data remains unfiltered, including gaps below 15%, with alert_eligible and alert_policy fields added. Prior snapshots and watches are preserved. During first upgrade, unsent old entry/hit messages are marked suppressed, not delivered; old unfiltered watches still track silently and are counted separately as legacy in report JSON. A newly eligible contract may alert under the new policy even if it had an old unfiltered watch today. Current-policy pending messages survive restarts normally.
-
-Stop the current job before uploading. Replace mcx_s3_bot.py, tests/test_mcx.py and README.md; the existing mcx_recorder.py, workflow and secrets need no changes. Commit and start a fresh run.
-
-## Compact message format
-
-Entry and Target share a single line, formatted to at most two decimal places without trailing zeroes. Entry uses the best ask captured at detection, not a claimed executed fill. Target is the original fixed model value; Observed price is shown separately when a later trade crosses it. Both CE and PE watches buy the option first and close by selling it. No short-option setup is emitted. The 15% minimum remains unchanged. Replace mcx_s3_bot.py and README.md for this display update; recorder, workflow, state and secrets stay compatible.

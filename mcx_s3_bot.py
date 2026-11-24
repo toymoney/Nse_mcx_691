@@ -19,7 +19,9 @@ from mcx_recorder import Recorder
 IST = ZoneInfo('Asia/Kolkata')
 MASTER_URL = 'https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz'
 VERSION = 'MCX_S3_RESEARCH_V1'
-ALERT_POLICY = 'MCX_OPTIONS_BUY_GAP15_V2'
+ALERT_POLICY = 'MCX_OPTIONS_BUY_GAP15_LIQUID_ATM4_V3'
+ALERT_FILTERS = {'min_gap_pct':15., 'max_spread_pct':2., 'min_oi_raw':500.,
+                 'min_volume_raw':100., 'max_trade_age_seconds':30., 'max_atm_steps':4}
 
 
 def now(): return datetime.now(IST)
@@ -241,13 +243,57 @@ def evaluate(rows, t, rate=.06):
     return rows
 
 
+def annotate_atm(rows):
+    """Use all listed strikes, including unquoted strikes; same future and option expiry."""
+    groups=defaultdict(list)
+    for row in rows: groups[(row['underlying_key'],row['expiry_at'])].append(row)
+    for group in groups.values():
+        strikes=sorted({r['strike'] for r in group if number(r.get('strike')) is not None})
+        futures_price=next((r['futures_price'] for r in group if number(r.get('futures_price')) is not None and r['futures_price']>0),None)
+        atm=min(strikes,key=lambda strike:(abs(strike-futures_price),-strike)) if strikes and futures_price else None
+        indices={strike:i for i,strike in enumerate(strikes)}
+        for row in group:
+            row['atm_strike']=atm
+            row['strike_steps_from_atm']=indices[row['strike']]-indices[atm] if atm is not None else None
+    return rows
+
+
+def alert_reasons(r):
+    reasons=[]
+    target=number(r.get('model_target'));ltp=number(r.get('ltp'))
+    ask=number(r.get('ask'));bid=number(r.get('bid'))
+    if r.get('model_status')!='computed' or not target or target<=0:
+        reasons.append('model_unavailable')
+    if ltp is None or ltp<=0:reasons.append('invalid_ltp')
+    if bid is None or ask is None or min(bid,ask)<=0:
+        reasons.append('missing_positive_book')
+    elif bid>ask:reasons.append('crossed_book')
+    else:
+        spread=100*(ask-bid)/((ask+bid)/2)
+        if spread>ALERT_FILTERS['max_spread_pct']+1e-12:reasons.append('spread_above_2pct')
+    if target and target>0:
+        if ltp is not None and (target-ltp)/target*100<ALERT_FILTERS['min_gap_pct']-1e-12:
+            reasons.append('ltp_gap_below_15pct')
+        if ask is not None and (target-ask)/target*100<ALERT_FILTERS['min_gap_pct']-1e-12:
+            reasons.append('ask_gap_below_15pct')
+    for field,minimum,label in [('oi_raw',ALERT_FILTERS['min_oi_raw'],'oi_below_500'),
+                                ('volume_raw',ALERT_FILTERS['min_volume_raw'],'volume_below_100')]:
+        value=number(r.get(field))
+        if value is None or value<minimum:reasons.append(label)
+    age=number(r.get('trade_age_seconds'))
+    if age is None or not 0<=age<=ALERT_FILTERS['max_trade_age_seconds']:
+        reasons.append('trade_age_above_30s_or_unknown')
+    for field in ('bid_qty_raw','ask_qty_raw'):
+        quantity=number(r.get(field))
+        if quantity is None or quantity<=0:reasons.append('missing_'+field)
+    steps=number(r.get('strike_steps_from_atm'))
+    if steps is None or abs(steps)>ALERT_FILTERS['max_atm_steps']:
+        reasons.append('outside_atm_plus_minus_4_or_unknown')
+    return reasons
+
+
 def alert_eligible(r):
-    target=number(r.get('model_target'));ltp=number(r.get('ltp'));ask=number(r.get('ask'));bid=number(r.get('bid'))
-    if r.get('model_status')!='computed' or not target or target<=0:return False
-    if ltp is None or ltp<=0 or ask is None or ask<=0:return False
-    if bid is not None and bid>ask:return False
-    # Model-relative gap, checked on the available buying price as well as last trade.
-    return (target-ltp)/target >= .15-1e-12 and (target-ask)/target >= .15-1e-12
+    return not alert_reasons(r)
 
 
 class Scanner:
@@ -259,8 +305,9 @@ class Scanner:
         if self.state.get('alert_policy')!=ALERT_POLICY:
             for message in self.state['outbox']:
                 if not message.get('sent') and message['id'].startswith(('entry-','hit-')):
-                    message['suppressed']='superseded_unfiltered_policy'
+                    message['suppressed']='superseded_alert_policy'
             self.state['alert_policy']=ALERT_POLICY
+        self.state['alert_filters']=ALERT_FILTERS
         self.telegram = telegram; self.master_day = None; self.options = []; self.futures = {}
         self.counts = Counter(); self.broker_greeks_available = True; self.last_send = 0.
 
@@ -304,8 +351,8 @@ class Scanner:
             self.master_day=day
             d=self.state['days'].setdefault(day,{'date':day,'sweeps':0,'counts':{},'reported':False})
             self.counts=Counter(d.get('counts',{}))
-            d.update(option_count=len(self.options),future_count=len(self.futures),discovery_skips=skipped)
-            self.emit('online-'+ALERT_POLICY+'-'+day,f'MCX S3 ONLINE | {day}\nOption buying only; minimum 15% model gap at both LTP and ask. All strikes, nearest expiry, '+', '.join(sorted({r['underlying_symbol'] for r in self.options}))+f'.\n{len(self.options)} options; raw snapshot recording ON.\n15%+ option-gap watches once per contract per day; all snapshots retained. Close {close_time(day):%H:%M} IST.')
+            d.update(alert_policy=ALERT_POLICY,alert_filters=ALERT_FILTERS,option_count=len(self.options),future_count=len(self.futures),discovery_skips=skipped)
+            self.emit('online-'+ALERT_POLICY+'-'+day,f'MCX S3 ONLINE | {day}\nOption buying only; minimum 15% gap at both LTP and ask; ATM ±4 only. Spread <=2%; OI >=500; volume >=100 (broker raw units); last trade <=30s. Recording all strikes, nearest expiry, '+', '.join(sorted({r['underlying_symbol'] for r in self.options}))+f'.\n{len(self.options)} options; raw snapshot recording ON.\n15%+ option-gap watches once per contract per day; all snapshots retained. Close {close_time(day):%H:%M} IST.')
         return self.state['days'][day]
 
     def report(self,day):
@@ -344,7 +391,7 @@ class Scanner:
             id_=hashlib.sha256((ALERT_POLICY+':'+day+':'+r['instrument_key']).encode()).hexdigest()[:16]
             w={'id':id_,'policy':ALERT_POLICY,'buy_reference':r['ask'],'ask_gap_pct':r['ask_gap_pct'],'key':r['instrument_key'],'symbol':r['symbol'],'strike':r['strike'],'side':r['side'],
                'day':day,'entered':r['observed_at'],'entry':r['ltp'],'target':r['model_target'],'status':'OPEN',
-               'gap_pct':r['gap_pct'],'quality_flags':r['quality_flags'],'snapshot_file':str(self.recorder.path.relative_to(self.root)),
+               'gap_pct':r['gap_pct'],'atm_strike':r.get('atm_strike'),'strike_steps_from_atm':r.get('strike_steps_from_atm'),'quality_flags':r['quality_flags'],'snapshot_file':str(self.recorder.path.relative_to(self.root)),
                'last_price':r['ltp'],'last_observed_at':r['observed_at']}
             self.state['watches'].append(w);existing.add((day,r['instrument_key']))
             option_name='CALL' if r['side']=='CE' else 'PUT'
@@ -388,9 +435,12 @@ class Scanner:
             r['evaluated_at']=iso(evaluated_at)
             rows.append(r)
         evaluate(rows,evaluated_at,float(os.getenv('RISK_FREE_RATE','.06')))
+        annotate_atm(rows)
         for r in rows:
             r['alert_policy']=ALERT_POLICY
-            r['alert_eligible']=alert_eligible(r)
+            r['alert_rejection_reasons']=alert_reasons(r)
+            r['alert_eligible']=not r['alert_rejection_reasons']
+            for reason in r['alert_rejection_reasons']:self.counts['alert_reject_'+reason]+=1
             self.recorder.write(r)
             self.counts[r['model_status']]+=1
         d.update(sweeps=d['sweeps']+1,last_sweep_at=iso(evaluated_at),last_sweep_seconds=round(time.monotonic()-start,2),counts=dict(self.counts))
@@ -450,3 +500,4 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode',choices=['run','once','test','record'],default='run')
     run(parser.parse_args().mode)
+
