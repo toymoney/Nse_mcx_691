@@ -9,11 +9,11 @@ Separate MCX project. Keep the existing NSE scanner running in its own repositor
 - `.github/workflows/mcx_s3.yml`: session schedules, tests, persistent MCX data branch and downloadable Actions data artifacts.
 - `tests/test_mcx.py`, `requirements.txt`, `.gitignore` and this guide.
 
-There are no strategy thresholds for gap size, OI, volume, volume/OI, bid/ask spread, depth, delta, IV or trade age. No ATM-only restriction and no five-day rollover. There are no order/trade execution endpoints.
+Telegram option-buy alerts require at least a 15% model-relative gap at both LTP and the available ask price. There are no additional OI, volume, volume/OI, spread, depth, delta, IV or trade-age thresholds. All snapshots remain unfiltered. No ATM-only restriction and no five-day rollover. There are no order/trade execution endpoints.
 
 Scope is all listed CE/PE strikes of the nearest active option expiry for CRUDEOIL, NATURALGAS, GOLD and SILVER. These are separate contract families; mini/micro variants are not silently substituted. Actual futures mapping uses the option's exact `underlying_key` from the master. We skip unmapped/expired contracts instead of guessing. Nearest expiry is a data-collection scope, not a tested signal filter. Set MCX_SYMBOLS to choose different master symbols; an empty value selects all MCX option symbols (verify their session/expiry specifications first).
 
-A new BUY-side model watch is made whenever the computed fixed model target exceeds LTP, with no minimum gap. One watch per contract per day prevents repeated Telegram alerts. Snapshot recording continues every sweep for every selected strike regardless of watches or outcomes. There is no active-commodity or CE/PE suppression. DOWN/zero-gap snapshots are saved for research but do not produce buy watches.
+A new BUY-side model watch is made only when both LTP and ask are at least 15% below the computed fixed model target. The instrument being bought is the CE/PE option; the futures price is only a valuation input. One watch per contract per day under the current alert policy prevents repeated Telegram alerts. Snapshot recording continues every sweep for every selected strike regardless of watches or outcomes. There is no active-commodity or CE/PE suppression. DOWN/zero-gap snapshots are saved for research but do not produce buy watches.
 
 ## First upload: new GitHub repository
 
@@ -60,7 +60,7 @@ Missing values remain null, never substituted with zero or yesterday's value. MC
 
 Broker Greeks and local calculated Greeks are different fields. The Greeks endpoint is requested in batches of at most 50. If it rejects MCX or becomes unavailable, the error is recorded and local calculations continue; broker fields remain missing. It retries broker Greek capability on the next job. Local IV is solved from each contract's own LTP; own IV is used for local Greeks only. For the candidate's target, own IV is excluded: the nearest usable same-expiry, same-side strikes on both sides supply interpolated peer IV. OI/spread do not weight that interpolation. Edge strikes or insufficient peer data are retained with a model-status reason, not an invented target.
 
-Mathematically impossible prices, nonpositive inputs and missing/different-day trade inputs cannot produce a model value. These are technical validity requirements, not strategy thresholds. Old same-day LTPs, wide spreads and shallow books are recorded and can produce flagged research watches: there is intentionally no strategy freshness/depth/spread gate.
+Mathematically impossible prices, nonpositive inputs and missing/different-day trade inputs cannot produce a model value. These are technical validity requirements, not strategy thresholds. Old same-day LTPs, wide spreads and shallow books are recorded and can produce flagged research watches: there is no additional strategy freshness/depth/spread gate; a crossed book cannot produce a new buy alert.
 
 ## Observation frequency and outcomes
 
@@ -68,7 +68,7 @@ This is a REST **snapshot** recorder, not an every-tick market-feed archive. The
 
 Targets are fixed when a watch is made. Only a later same-day last trade with a timestamp strictly AFTER entry can confirm a target. Repeated stale quotes cannot manufacture hits. The report uses `TARGET_OBSERVED` or `NO_TOUCH_OBSERVED`; it does not assert full tick/candle coverage. No stop-loss, fees or fill simulation is implemented. Offline analysis labels records with no later data as `NO_LATER_DATA`.
 
-Telegram sends at most five queued messages per loop and prioritises startup/test/report and target updates. Without thresholds, many model watches can be created; all are persisted, while Telegram delivery may lag. Each contract alerts once daily; a crash during a successful but unacknowledged Telegram request can cause a duplicate on retry.
+Telegram sends at most five queued messages per loop and prioritises startup/test/report and target updates. The 15% gap threshold reduces Telegram model watches; all are persisted, while Telegram delivery may lag. Each contract alerts once daily; a crash during a successful but unacknowledged Telegram request can cause a duplicate on retry.
 
 ## MCX session and persistence
 
@@ -131,3 +131,17 @@ Official references:
 - https://upstox.com/developer/api-documentation/get-pc-option-chain/ (MCX option-chain endpoint unavailable; this code does not call it)
 - https://www.mcxindia.com/faq/market-operations (Black-76 for options on futures)
 - https://upstox.com/announcements/revised-timings/
+
+## Option buying: 15% alert restriction update
+
+Only live/paper alert selection changes. Require (model target - LTP)/model target >=0.15 AND (model target - best ask)/model target >=0.15. No upper gap cap. A missing/nonpositive ask or crossed book is not a valid buy reference. Model-relative gap is distinct from return on purchase price: model 100 and ask 85 is a 15% model gap. The futures instrument is NEVER traded; only the option CE/PE is identified.
+
+Messages now say BUY MCX OPTION, specify CALL/PUT, expiry, buy reference (ask), sell target and ask-based gap. No stop-loss is invented; the alert says it is not set. Quote prices are references at the recorded timestamp. No order endpoints exist.
+
+Recorder data remains unfiltered, including gaps below 15%, with alert_eligible and alert_policy fields added. Prior snapshots and watches are preserved. During first upgrade, unsent old entry/hit messages are marked suppressed, not delivered; old unfiltered watches still track silently and are counted separately as legacy in report JSON. A newly eligible contract may alert under the new policy even if it had an old unfiltered watch today. Current-policy pending messages survive restarts normally.
+
+Stop the current job before uploading. Replace mcx_s3_bot.py, tests/test_mcx.py and README.md; the existing mcx_recorder.py, workflow and secrets need no changes. Commit and start a fresh run.
+
+## Compact message format
+
+Entry and Target share a single line, formatted to at most two decimal places without trailing zeroes. Entry uses the best ask captured at detection, not a claimed executed fill. Target is the original fixed model value; Observed price is shown separately when a later trade crosses it. Both CE and PE watches buy the option first and close by selling it. No short-option setup is emitted. The 15% minimum remains unchanged. Replace mcx_s3_bot.py and README.md for this display update; recorder, workflow, state and secrets stay compatible.

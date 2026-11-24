@@ -19,6 +19,7 @@ from mcx_recorder import Recorder
 IST = ZoneInfo('Asia/Kolkata')
 MASTER_URL = 'https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz'
 VERSION = 'MCX_S3_RESEARCH_V1'
+ALERT_POLICY = 'MCX_OPTIONS_BUY_GAP15_V2'
 
 
 def now(): return datetime.now(IST)
@@ -35,6 +36,9 @@ def timestamp(x):
         if n is not None: return datetime.fromtimestamp(n/1000 if n > 1e11 else n, IST)
         return datetime.fromisoformat(str(x).replace('Z', '+00:00')).astimezone(IST)
     except (ValueError, TypeError, OverflowError, OSError): return None
+
+def price_text(value):
+    return f'{value:.2f}'.rstrip('0').rstrip('.')
 
 def normal_cdf(x): return (1 + math.erf(x / math.sqrt(2))) / 2
 
@@ -237,12 +241,26 @@ def evaluate(rows, t, rate=.06):
     return rows
 
 
+def alert_eligible(r):
+    target=number(r.get('model_target'));ltp=number(r.get('ltp'));ask=number(r.get('ask'));bid=number(r.get('bid'))
+    if r.get('model_status')!='computed' or not target or target<=0:return False
+    if ltp is None or ltp<=0 or ask is None or ask<=0:return False
+    if bid is not None and bid>ask:return False
+    # Model-relative gap, checked on the available buying price as well as last trade.
+    return (target-ltp)/target >= .15-1e-12 and (target-ask)/target >= .15-1e-12
+
+
 class Scanner:
     def __init__(self, api, root, telegram=True):
         self.api = api; self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root/'state.json'; self.recorder = Recorder(self.root/'snapshots')
         self.state = json.loads(self.path.read_text()) if self.path.exists() else {'version':VERSION,'days':{},'watches':[],'outbox':[]}
         if self.state.get('version') != VERSION: raise RuntimeError('Wrong state directory; keep NSE and MCX separate')
+        if self.state.get('alert_policy')!=ALERT_POLICY:
+            for message in self.state['outbox']:
+                if not message.get('sent') and message['id'].startswith(('entry-','hit-')):
+                    message['suppressed']='superseded_unfiltered_policy'
+            self.state['alert_policy']=ALERT_POLICY
         self.telegram = telegram; self.master_day = None; self.options = []; self.futures = {}
         self.counts = Counter(); self.broker_greeks_available = True; self.last_send = 0.
 
@@ -262,7 +280,7 @@ class Scanner:
         token=os.getenv('TELEGRAM_BOT_TOKEN'); chat=os.getenv('TELEGRAM_CHAT_ID')
         if not token or not chat: raise RuntimeError('Telegram secrets missing; use record mode for no Telegram')
         sent=0
-        pending=sorted((m for m in self.state['outbox'] if not m['sent']),
+        pending=sorted((m for m in self.state['outbox'] if not m['sent'] and not m.get('suppressed')),
                        key=lambda m: 0 if m['id'].startswith(('report-','test-','online-')) else 1 if m['id'].startswith('hit-') else 2)
         for m in pending:
             time.sleep(max(0,3.2-(time.monotonic()-self.last_send)))
@@ -287,7 +305,7 @@ class Scanner:
             d=self.state['days'].setdefault(day,{'date':day,'sweeps':0,'counts':{},'reported':False})
             self.counts=Counter(d.get('counts',{}))
             d.update(option_count=len(self.options),future_count=len(self.futures),discovery_skips=skipped)
-            self.emit('online-'+day,f'MCX S3 ONLINE | {day}\nResearch mode: no strategy thresholds. All strikes, nearest expiry, '+', '.join(sorted({r['underlying_symbol'] for r in self.options}))+f'.\n{len(self.options)} options; raw snapshot recording ON.\nPositive model-gap watches once per contract per day. Close {close_time(day):%H:%M} IST.')
+            self.emit('online-'+ALERT_POLICY+'-'+day,f'MCX S3 ONLINE | {day}\nOption buying only; minimum 15% model gap at both LTP and ask. All strikes, nearest expiry, '+', '.join(sorted({r['underlying_symbol'] for r in self.options}))+f'.\n{len(self.options)} options; raw snapshot recording ON.\n15%+ option-gap watches once per contract per day; all snapshots retained. Close {close_time(day):%H:%M} IST.')
         return self.state['days'][day]
 
     def report(self,day):
@@ -296,12 +314,13 @@ class Scanner:
         watches=[w for w in self.state['watches'] if w['day']==day]
         for w in watches:
             if w['status']=='OPEN':w['status']='NO_TOUCH_OBSERVED'
-        counts=Counter(w['status'] for w in watches)
-        report={'day':d,'watches':watches,'outcomes':dict(counts),
+        cohort=[w for w in watches if w.get('policy')==ALERT_POLICY]
+        counts=Counter(w['status'] for w in cohort)
+        report={'day':d,'watches':watches,'outcomes':dict(counts),'alert_policy':ALERT_POLICY,'new_policy_watches':len(cohort),'legacy_watches':len(watches)-len(cohort),
                 'evidence':'Same-day post-entry polled LTP only. No full-tick or complete candle coverage claimed.'}
         folder=self.root/'reports';folder.mkdir(exist_ok=True)
         (folder/(day+'.json')).write_text(json.dumps(report,indent=2))
-        text=f'MCX S3 DAILY | {day}\nSweeps {d["sweeps"]}; options {d["option_count"]}\nWatches {len(watches)}; target observed {counts["TARGET_OBSERVED"]}; no touch observed {counts["NO_TOUCH_OBSERVED"]}.\nAll raw snapshots saved, including contracts without a model/watch.\nPolled observations; use recorded data for filter comparison.'
+        text=f'MCX S3 DAILY | {day}\nSweeps {d["sweeps"]}; options {d["option_count"]}\n15%+ option watches {len(cohort)}; target observed {counts["TARGET_OBSERVED"]}; no touch observed {counts["NO_TOUCH_OBSERVED"]}.\nAll raw snapshots saved, including contracts without a model/watch.\nPolled observations; use recorded data for filter comparison.'
         (folder/(day+'.txt')).write_text(text);self.emit('report-'+day,text)
         d['reported']=True; self.save()
 
@@ -316,18 +335,20 @@ class Scanner:
             w.update(last_price=r['ltp'],last_observed_at=r['observed_at'])
             if r['ltp']>=w['target']:
                 w.update(status='TARGET_OBSERVED',hit_at=r['last_trade_at'],hit_price=r['ltp'])
-                self.emit('hit-'+w['id'],f'MCX S3 TARGET OBSERVED | {w["symbol"]} {w["strike"]:g} {w["side"]}\nEntry reference {w["entry"]:.4f}; fixed target {w["target"]:.4f}; observed LTP {r["ltp"]:.4f}\n{r["last_trade_at"]}')
-        existing={(w['day'],w['key']) for w in self.state['watches']}
+                if w.get('policy')==ALERT_POLICY:
+                    self.emit('hit-'+w['id'],f'🎯 TARGET REACHED | {w["symbol"]} {w["strike"]:g} {w["side"]}\nEntry ₹{price_text(w.get("buy_reference",w["entry"]))} | Target ₹{price_text(w["target"])}\nObserved price ₹{price_text(r["ltp"])}\nGap at entry {w.get("ask_gap_pct",w["gap_pct"]):.2f}%\n{r["last_trade_at"]}')
+        existing={(w['day'],w['key']) for w in self.state['watches'] if w.get('policy')==ALERT_POLICY}
         for r in rows:
-            if r.get('model_status')!='computed' or not r.get('gap_pct',0)>0:continue
+            if not alert_eligible(r):continue
             if (day,r['instrument_key']) in existing:continue
-            id_=hashlib.sha256((day+':'+r['instrument_key']).encode()).hexdigest()[:16]
-            w={'id':id_,'key':r['instrument_key'],'symbol':r['symbol'],'strike':r['strike'],'side':r['side'],
+            id_=hashlib.sha256((ALERT_POLICY+':'+day+':'+r['instrument_key']).encode()).hexdigest()[:16]
+            w={'id':id_,'policy':ALERT_POLICY,'buy_reference':r['ask'],'ask_gap_pct':r['ask_gap_pct'],'key':r['instrument_key'],'symbol':r['symbol'],'strike':r['strike'],'side':r['side'],
                'day':day,'entered':r['observed_at'],'entry':r['ltp'],'target':r['model_target'],'status':'OPEN',
                'gap_pct':r['gap_pct'],'quality_flags':r['quality_flags'],'snapshot_file':str(self.recorder.path.relative_to(self.root)),
                'last_price':r['ltp'],'last_observed_at':r['observed_at']}
             self.state['watches'].append(w);existing.add((day,r['instrument_key']))
-            self.emit('entry-'+id_,f'MCX S3 MODEL WATCH | {r["symbol"]} {r["strike"]:g} {r["side"]}\nExpiry {r["expiry_at"][:10]} | futures {r["futures_price"]:.4f}\nLTP {r["ltp"]:.4f}; fixed target {r["model_target"]:.4f}; gap {r["gap_pct"]:.2f}%\nBid {r["bid"]}; ask {r["ask"]}; spread {r["spread_pct_mid"]}%\nOI {r["oi_raw"]}; volume {r["volume_raw"]} (broker raw units)\nQuality flags: {", ".join(r["quality_flags"]) or "none"}\nNo strategy thresholds. {r["observed_at"]}')
+            option_name='CALL' if r['side']=='CE' else 'PUT'
+            self.emit('entry-'+id_,f'🟢 BUY MCX OPTION | {r["symbol"]} {r["strike"]:g} {r["side"]} ({option_name})\nExpiry: {r["expiry_at"][:10]}\nEntry ₹{price_text(r["ask"])} | Target ₹{price_text(r["model_target"])}\nGap below model value at ask: {r["ask_gap_pct"]:.2f}%\nStop-loss: not set\n{r["observed_at"][11:19]} IST | Option premium; not a futures trade')
 
     def sweep(self,t,create_watches=True):
         d=self.prepare(t); start=time.monotonic()
@@ -368,13 +389,15 @@ class Scanner:
             rows.append(r)
         evaluate(rows,evaluated_at,float(os.getenv('RISK_FREE_RATE','.06')))
         for r in rows:
+            r['alert_policy']=ALERT_POLICY
+            r['alert_eligible']=alert_eligible(r)
             self.recorder.write(r)
             self.counts[r['model_status']]+=1
         d.update(sweeps=d['sweeps']+1,last_sweep_at=iso(evaluated_at),last_sweep_seconds=round(time.monotonic()-start,2),counts=dict(self.counts))
         # Do not produce post-close watches/hits from a request completing late.
         if create_watches and evaluated_at<=session_close(evaluated_at): self.process(rows,evaluated_at,d['date'])
         self.save()
-        print(f'MCX {evaluated_at:%H:%M:%S} sweep={d["sweeps"]} snapshots={len(rows)} computed={sum(r["model_status"]=="computed" for r in rows)} pending={sum(not m["sent"] for m in self.state["outbox"])}',flush=True)
+        print(f'MCX {evaluated_at:%H:%M:%S} sweep={d["sweeps"]} snapshots={len(rows)} computed={sum(r["model_status"]=="computed" for r in rows)} pending={sum(not m["sent"] and not m.get("suppressed") for m in self.state["outbox"])}',flush=True)
 
     def checkpoint(self):
         self.recorder.close();self.save()
