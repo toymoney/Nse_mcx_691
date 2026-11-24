@@ -109,7 +109,7 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             s=b.Scanner(None,root,telegram=False)
             row=b.snapshot(contract(),quote(),T,(quote(100),T))
-            row.update(model_status='computed',model_target=12,gap_pct=100*(12-10)/12,ask_gap_pct=20,ask=9.6,futures_price=100)
+            row.update(model_status='computed',model_target=12,gap_pct=100*(12-10)/12,ask_gap_pct=20,ask=9.6,bid=9.55,futures_price=100,oi_raw=1000,volume_raw=500,trade_age_seconds=0,strike_steps_from_atm=0)
             s.recorder.write(row);s.process([row],T,T.date().isoformat());s.save()
             s.process([row],T,T.date().isoformat());self.assertEqual(len(s.state['watches']),1)
             s.recorder.close();s=b.Scanner(None,root,telegram=False)
@@ -131,7 +131,9 @@ class WatchTests(unittest.TestCase):
 class GapTests(unittest.TestCase):
     def test_ltp_and_ask_15pct_boundaries(self):
         for price,ask,expected in [(85,85,True),(84,85,True),(85.01,85,False),(84,85.01,False),(80,101,False),(80,None,False)]:
-            row={'model_status':'computed','model_target':100,'ltp':price,'ask':ask}
+            row={'model_status':'computed','model_target':100,'ltp':price,'ask':ask,
+                 'bid':84,'oi_raw':500,'volume_raw':100,'trade_age_seconds':30,
+                 'strike_steps_from_atm':0,'bid_qty_raw':1,'ask_qty_raw':1}
             self.assertEqual(b.alert_eligible(row),expected)
     def test_old_pending_alerts_suppressed_without_deleting_data(self):
         import json
@@ -139,7 +141,7 @@ class GapTests(unittest.TestCase):
             Path(root,'state.json').write_text(json.dumps({'version':b.VERSION,'days':{},'watches':[],
                 'outbox':[{'id':'entry-old:0','sent':False,'text':'old'}]}))
             scanner=b.Scanner(None,root)
-            self.assertEqual(scanner.state['outbox'][0]['suppressed'],'superseded_unfiltered_policy')
+            self.assertEqual(scanner.state['outbox'][0]['suppressed'],'superseded_alert_policy')
             scanner.emit('entry-new','new');scanner.save()
             reloaded=b.Scanner(None,root)
             self.assertNotIn('suppressed',reloaded.state['outbox'][1])
@@ -159,13 +161,18 @@ class IntegrationTests(unittest.TestCase):
                     else:
                         c=next(c for c in contracts if c['instrument_key']==key)
                         years=(b.expiry_at(c)-T).total_seconds()/(365*86400)
-                        q=quote(b.black76(100,c['strike_price'],years,.15 if c['strike_price']==100 else .3,'CE'))
+                        premium=b.black76(100,c['strike_price'],years,.15 if c['strike_price']==100 else .3,'CE')
+                        q=quote(premium);q.update(oi=1000,volume=500)
+                        q['depth']['buy'][0]['price']=premium*.995
+                        q['depth']['sell'][0]['price']=premium*1.005
                     result[key]=(q,T)
                 return result
         with tempfile.TemporaryDirectory() as root,patch.object(b,'now',return_value=T):
             scanner=b.Scanner(API(),root,telegram=False);scanner.sweep(T);scanner.recorder.close()
             rows=[r for r in records(Path(root)/'snapshots') if r['kind']=='option']
             self.assertEqual(len(rows),3)
+            self.assertTrue(any(r['alert_rejection_reasons'] for r in rows))
+            self.assertTrue(all('strike_steps_from_atm' in r for r in rows))
             self.assertTrue(all(r['broker_greeks'] is None for r in rows))
             self.assertEqual(len(scanner.state['watches']),1)
             self.assertEqual(scanner.state['days']['2026-11-24']['last_quote_count'],3)
@@ -176,4 +183,53 @@ class IntegrationTests(unittest.TestCase):
             scanner.emit('entry-X','message');scanner.emit('entry-X','message')
             self.assertEqual(len(scanner.state['outbox']),1)
 
+class LiquidityTests(unittest.TestCase):
+    def valid(self):
+        return {'model_status':'computed','model_target':100,'ltp':84,'ask':85,'bid':84,
+                'oi_raw':500,'volume_raw':100,'trade_age_seconds':30,
+                'strike_steps_from_atm':4,'bid_qty_raw':1,'ask_qty_raw':1}
+    def test_each_liquidity_failure_and_inclusive_boundaries(self):
+        self.assertTrue(b.alert_eligible(self.valid()))
+        changes={'oi_raw':499,'volume_raw':99,'trade_age_seconds':30.01,
+                 'strike_steps_from_atm':5,'bid_qty_raw':0,'ask_qty_raw':None,'bid':82}
+        for field,value in changes.items():
+            with self.subTest(field=field):
+                r=self.valid();r[field]=value;self.assertFalse(b.alert_eligible(r))
+        for field in self.valid():
+            if field=='model_status':continue
+            with self.subTest(missing=field):
+                r=self.valid();r[field]=None;self.assertFalse(b.alert_eligible(r))
+    def test_spread_2pct_boundary_and_crossed_book(self):
+        r=self.valid();r.update(bid=83.16,ask=84.84)
+        self.assertTrue(b.alert_eligible(r))
+        r['bid']=83.159;self.assertFalse(b.alert_eligible(r))
+        r=self.valid();r['bid']=86;self.assertIn('crossed_book',b.alert_reasons(r))
+    def test_negative_age_and_nonfinite_rejected(self):
+        for field,value in [('trade_age_seconds',-1),('oi_raw',float('inf')),('volume_raw',float('nan'))]:
+            r=self.valid();r[field]=value;self.assertFalse(b.alert_eligible(r))
+    def test_atm_full_list_ties_and_plus_minus_four_both_sides(self):
+        strikes=[50,60,80,90,95,100,110,120,150,160,180]
+        rows=[dict(underlying_key='F',expiry_at='E',strike=k,futures_price=105,side=side) for k in strikes for side in ['CE','PE']]
+        b.annotate_atm(rows)
+        self.assertTrue(all(r['atm_strike']==110 for r in rows))
+        allowed={r['strike'] for r in rows if abs(r['strike_steps_from_atm'])<=4}
+        self.assertEqual(allowed,{80,90,95,100,110,120,150,160,180})
+        self.assertEqual(sum(abs(r['strike_steps_from_atm'])<=4 for r in rows),18)
+    def test_atm_missing_future_does_not_pass_and_separates_groups(self):
+        rows=[dict(underlying_key='F',expiry_at='E',strike=100,futures_price=None),
+              dict(underlying_key='F2',expiry_at='E',strike=200,futures_price=200)]
+        b.annotate_atm(rows)
+        self.assertIsNone(rows[0]['strike_steps_from_atm']);self.assertEqual(rows[1]['strike_steps_from_atm'],0)
+    def test_recording_preserves_rejected_contracts(self):
+        import json
+        r=self.valid();r.update(volume_raw=8,kind='option',observed_at=b.iso(T),instrument_key='X')
+        r['alert_rejection_reasons']=b.alert_reasons(r)
+        with tempfile.TemporaryDirectory() as root:
+            rec=Recorder(root);rec.write(r);rec.close()
+            saved=list(records(root));self.assertEqual(len(saved),1)
+            self.assertIn('volume_below_100',saved[0]['alert_rejection_reasons'])
+            out=Path(root)/'export.csv';export_csv(root,out)
+            self.assertIn('volume_below_100',out.read_text())
+
 if __name__=='__main__':unittest.main()
+
