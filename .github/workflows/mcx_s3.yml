@@ -1,1 +1,86 @@
-
+name: MCX S3 scanner and recorder
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'test = one sweep; run = alerts + recording; record = recording only; once = one sweep + alerts'
+        required: true
+        default: test
+        type: choice
+        options: [test, run, record, once]
+  schedule:
+    - cron: '20 3 * * 1-5'   # 08:50 IST
+    - cron: '10 8 * * 1-5'   # 13:40 IST
+    - cron: '0 13 * * 1-5'   # 18:30 IST
+    - cron: '50 17 * * 1-5'  # 23:20 IST
+permissions:
+  contents: write
+concurrency:
+  group: mcx-s3-research-state
+  cancel-in-progress: false
+jobs:
+  mcx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 335
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Offline tests
+        run: python -m unittest discover -s tests -v
+      - name: Open MCX data branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git ls-remote --exit-code --heads origin mcx-research-state >/dev/null 2>&1; then
+            git fetch origin mcx-research-state
+            git worktree add -B mcx-research-state .mcx-state FETCH_HEAD
+          else
+            tree_id=$(git hash-object -t tree /dev/null)
+            commit_id=$(git commit-tree "$tree_id" -m 'Initialize MCX research journal')
+            git worktree add -b mcx-research-state .mcx-state "$commit_id"
+          fi
+      - name: MCX scan and record
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MCX_STATE_DIR: .mcx-state
+          GIT_STATE: 'true'
+          MAX_RUN_MINUTES: '295'
+          SNAPSHOT_INTERVAL_SECONDS: '60'
+          MCX_SYMBOLS: 'CRUDEOIL,NATURALGAS,GOLD,SILVER'
+          SCANNER_MODE: ${{ inputs.mode || 'run' }}
+          PYTHONUNBUFFERED: '1'
+        run: python mcx_s3_bot.py --mode "$SCANNER_MODE"
+      - name: Save MCX snapshots on exit
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .mcx-state/state.json ]; then
+            git -C .mcx-state add .
+            if ! git -C .mcx-state diff --cached --quiet; then
+              git -C .mcx-state commit -m 'Save MCX data on exit [skip ci]'
+            fi
+            git -C .mcx-state push origin HEAD:mcx-research-state
+          fi
+      - name: Downloadable MCX data copy
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcx-data-${{ github.run_id }}
+          path: |
+            .mcx-state/state.json
+            .mcx-state/reports/
+            .mcx-state/snapshots/
+            .mcx-state/master-*.json.gz
+          if-no-files-found: warn
+          retention-days: 7
+          include-hidden-files: true
