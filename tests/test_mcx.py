@@ -109,7 +109,7 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             s=b.Scanner(None,root,telegram=False)
             row=b.snapshot(contract(),quote(),T,(quote(100),T))
-            row.update(model_status='computed',model_target=12,gap_pct=10,futures_price=100)
+            row.update(model_status='computed',model_target=12,gap_pct=100*(12-10)/12,ask_gap_pct=20,ask=9.6,futures_price=100)
             s.recorder.write(row);s.process([row],T,T.date().isoformat());s.save()
             s.process([row],T,T.date().isoformat());self.assertEqual(len(s.state['watches']),1)
             s.recorder.close();s=b.Scanner(None,root,telegram=False)
@@ -128,6 +128,22 @@ class WatchTests(unittest.TestCase):
             self.assertEqual(s.state['watches'][0]['status'],'NO_TOUCH_OBSERVED')
 
 
+class GapTests(unittest.TestCase):
+    def test_ltp_and_ask_15pct_boundaries(self):
+        for price,ask,expected in [(85,85,True),(84,85,True),(85.01,85,False),(84,85.01,False),(80,101,False),(80,None,False)]:
+            row={'model_status':'computed','model_target':100,'ltp':price,'ask':ask}
+            self.assertEqual(b.alert_eligible(row),expected)
+    def test_old_pending_alerts_suppressed_without_deleting_data(self):
+        import json
+        with tempfile.TemporaryDirectory() as root:
+            Path(root,'state.json').write_text(json.dumps({'version':b.VERSION,'days':{},'watches':[],
+                'outbox':[{'id':'entry-old:0','sent':False,'text':'old'}]}))
+            scanner=b.Scanner(None,root)
+            self.assertEqual(scanner.state['outbox'][0]['suppressed'],'superseded_unfiltered_policy')
+            scanner.emit('entry-new','new');scanner.save()
+            reloaded=b.Scanner(None,root)
+            self.assertNotIn('suppressed',reloaded.state['outbox'][1])
+
 class IntegrationTests(unittest.TestCase):
     def test_sweep_records_all_and_falls_back_when_greeks_unavailable(self):
         from unittest.mock import patch
@@ -143,7 +159,7 @@ class IntegrationTests(unittest.TestCase):
                     else:
                         c=next(c for c in contracts if c['instrument_key']==key)
                         years=(b.expiry_at(c)-T).total_seconds()/(365*86400)
-                        q=quote(b.black76(100,c['strike_price'],years,.2 if c['strike_price']==100 else .3,'CE'))
+                        q=quote(b.black76(100,c['strike_price'],years,.15 if c['strike_price']==100 else .3,'CE'))
                     result[key]=(q,T)
                 return result
         with tempfile.TemporaryDirectory() as root,patch.object(b,'now',return_value=T):
