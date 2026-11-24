@@ -47,15 +47,15 @@ class MathTests(unittest.TestCase):
     def test_missing_data_is_null(self):
         r=b.snapshot(contract(),{},T)
         self.assertIsNone(r['oi_raw']);self.assertIsNone(r['bid']);self.assertIn('missing_quote',r['quality_flags'])
-    def test_peer_excludes_own_and_no_strategy_filters(self):
+    def test_illiquid_peers_rejected_but_raw_data_preserved(self):
         rows=[]
         for k,vol in [(90,.3),(100,.2),(110,.3)]:
             c=contract(k);years=(b.expiry_at(c)-T).total_seconds()/(365*86400)
             q=quote(b.black76(100,k,years,vol,'CE'))
             rows.append(b.snapshot(c,q,T,(quote(100),T)))
         b.evaluate(rows,T)
-        self.assertAlmostEqual(rows[1]['peer_iv_pct'],30)
-        self.assertGreater(rows[1]['gap_pct'],0)
+        self.assertIsNone(rows[1]['peer_iv_pct'])
+        self.assertEqual(rows[1]['model_status'],'peer_liquidity_or_freshness_failed')
         self.assertEqual(rows[1]['oi_raw'],1)
         self.assertGreater(rows[1]['spread_pct_mid'],30)
         self.assertEqual(rows[0]['model_status'],'missing_bracketing_peer_iv')
@@ -109,7 +109,7 @@ class WatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             s=b.Scanner(None,root,telegram=False)
             row=b.snapshot(contract(),quote(),T,(quote(100),T))
-            row.update(model_status='computed',model_target=12,gap_pct=100*(12-10)/12,ask_gap_pct=20,ask=9.6,bid=9.55,futures_price=100,oi_raw=1000,volume_raw=500,trade_age_seconds=0,strike_steps_from_atm=0)
+            row.update(model_status='computed',model_target=10.3,gap_pct=100*(10.3-10)/10.3,ask_gap_pct=2.9,ask=10,bid=9.95,futures_price=100,oi_raw=1000,volume_raw=500,trade_age_seconds=0,strike_steps_from_atm=0)
             s.recorder.write(row);s.process([row],T,T.date().isoformat());s.save()
             s.process([row],T,T.date().isoformat());self.assertEqual(len(s.state['watches']),1)
             s.recorder.close();s=b.Scanner(None,root,telegram=False)
@@ -129,10 +129,10 @@ class WatchTests(unittest.TestCase):
 
 
 class GapTests(unittest.TestCase):
-    def test_ltp_and_ask_15pct_boundaries(self):
-        for price,ask,expected in [(85,85,True),(84,85,True),(85.01,85,False),(84,85.01,False),(80,101,False),(80,None,False)]:
+    def test_ltp_and_ask_2_to_5pct_boundaries(self):
+        for price,ask,expected in [(98,98,True),(95,95,True),(97,98,True),(98.01,98.01,False),(94.99,95,False),(97,98.01,False),(97,None,False)]:
             row={'model_status':'computed','model_target':100,'ltp':price,'ask':ask,
-                 'bid':84,'oi_raw':500,'volume_raw':100,'trade_age_seconds':30,
+                 'bid':ask-.1 if ask else 97,'oi_raw':500,'volume_raw':100,'trade_age_seconds':30,
                  'strike_steps_from_atm':0,'bid_qty_raw':1,'ask_qty_raw':1}
             self.assertEqual(b.alert_eligible(row),expected)
     def test_old_pending_alerts_suppressed_without_deleting_data(self):
@@ -174,7 +174,7 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue(any(r['alert_rejection_reasons'] for r in rows))
             self.assertTrue(all('strike_steps_from_atm' in r for r in rows))
             self.assertTrue(all(r['broker_greeks'] is None for r in rows))
-            self.assertEqual(len(scanner.state['watches']),1)
+            self.assertEqual(len(scanner.state['watches']),0)
             self.assertEqual(scanner.state['days']['2026-11-24']['last_quote_count'],3)
             scanner.report('2026-11-24')
     def test_telegram_queue_event_dedup(self):
@@ -185,13 +185,13 @@ class IntegrationTests(unittest.TestCase):
 
 class LiquidityTests(unittest.TestCase):
     def valid(self):
-        return {'model_status':'computed','model_target':100,'ltp':84,'ask':85,'bid':84,
+        return {'model_status':'computed','model_target':100,'ltp':97,'ask':97,'bid':96.5,
                 'oi_raw':500,'volume_raw':100,'trade_age_seconds':30,
                 'strike_steps_from_atm':4,'bid_qty_raw':1,'ask_qty_raw':1}
     def test_each_liquidity_failure_and_inclusive_boundaries(self):
         self.assertTrue(b.alert_eligible(self.valid()))
         changes={'oi_raw':499,'volume_raw':99,'trade_age_seconds':30.01,
-                 'strike_steps_from_atm':5,'bid_qty_raw':0,'ask_qty_raw':None,'bid':82}
+                 'strike_steps_from_atm':5,'bid_qty_raw':0,'ask_qty_raw':None,'bid':93}
         for field,value in changes.items():
             with self.subTest(field=field):
                 r=self.valid();r[field]=value;self.assertFalse(b.alert_eligible(r))
@@ -200,10 +200,10 @@ class LiquidityTests(unittest.TestCase):
             with self.subTest(missing=field):
                 r=self.valid();r[field]=None;self.assertFalse(b.alert_eligible(r))
     def test_spread_2pct_boundary_and_crossed_book(self):
-        r=self.valid();r.update(bid=83.16,ask=84.84)
+        r=self.valid();r.update(bid=95.04,ask=96.96)
         self.assertTrue(b.alert_eligible(r))
-        r['bid']=83.159;self.assertFalse(b.alert_eligible(r))
-        r=self.valid();r['bid']=86;self.assertIn('crossed_book',b.alert_reasons(r))
+        r['bid']=95.039;self.assertFalse(b.alert_eligible(r))
+        r=self.valid();r['bid']=98;self.assertIn('crossed_book',b.alert_reasons(r))
     def test_negative_age_and_nonfinite_rejected(self):
         for field,value in [('trade_age_seconds',-1),('oi_raw',float('inf')),('volume_raw',float('nan'))]:
             r=self.valid();r[field]=value;self.assertFalse(b.alert_eligible(r))
@@ -233,3 +233,28 @@ class LiquidityTests(unittest.TestCase):
 
 if __name__=='__main__':unittest.main()
 
+
+class PeerInputTests(unittest.TestCase):
+    def rows(self):
+        rows=[]
+        for k,vol in [(90,.3),(100,.29),(110,.3)]:
+            c=contract(k);years=(b.expiry_at(c)-T).total_seconds()/(365*86400)
+            premium=b.black76(100,k,years,vol,'CE')
+            q=quote(premium);q.update(oi=500,volume=100)
+            q['depth']['buy'][0]['price']=premium*.995
+            q['depth']['sell'][0]['price']=premium*1.005
+            rows.append(b.snapshot(c,q,T,(quote(100),T)))
+        return rows
+    def test_midpoints_used_instead_of_stale_price_level(self):
+        rows=self.rows();rows[0]['ltp']*=1.1
+        b.evaluate(rows,T)
+        self.assertAlmostEqual(rows[1]['peer_iv_pct'],30,places=6)
+        self.assertEqual(rows[1]['model_status'],'computed')
+    def test_each_bad_peer_blocks_model_and_records_reason(self):
+        for field,value in [('oi_raw',499),('volume_raw',99),('trade_age_seconds',31),('bid_qty_raw',0),('ask',None)]:
+            for index in (0,2):
+                with self.subTest(field=field,index=index):
+                    rows=self.rows();rows[index][field]=value;b.evaluate(rows,T)
+                    self.assertIsNone(rows[1]['model_target'])
+                    self.assertEqual(rows[1]['model_status'],'peer_liquidity_or_freshness_failed')
+                    self.assertTrue(any(c['reasons'] for c in rows[1]['peer_input_checks']))
