@@ -1,0 +1,5 @@
+MCX S3 DAILY | 2026-11-24
+Sweeps 215; options 1518
+2–5% option watches 0; target observed 0; no touch observed 0.
+All raw snapshots saved, including contracts without a model/watch.
+Polled observations; use recorded data for filter comparison.
