@@ -1,0 +1,47 @@
+test_atm_recomputed_from_full_master_after_future_moves (test_fresh_fetch.FetchTests.test_atm_recomputed_from_full_master_after_future_moves) ... ok
+test_four_instruments_single_request_and_fixed_target_no_preentry_hit (test_fresh_fetch.FetchTests.test_four_instruments_single_request_and_fixed_target_no_preentry_hit) ... ok
+test_missing_refresh_never_uses_cached_input (test_fresh_fetch.FetchTests.test_missing_refresh_never_uses_cached_input) ... ok
+test_priority_alert_sent_before_far_strikes_or_greeks (test_fresh_fetch.FetchTests.test_priority_alert_sent_before_far_strikes_or_greeks) ... MCX 12:00:00 sweep=1 quotes=17 valid_pricing_gap_too_small=7 blocked_stale_inputs=0
+ok
+test_priority_before_background_and_greeks_all_raw_preserved (test_fresh_fetch.FetchTests.test_priority_before_background_and_greeks_all_raw_preserved) ... MCX 12:00:00 sweep=1 quotes=17 valid_pricing_gap_too_small=7 blocked_stale_inputs=0
+ok
+test_rejected_delivery_can_retry_without_duplicate_watch (test_fresh_fetch.FetchTests.test_rejected_delivery_can_retry_without_duplicate_watch) ... ok
+test_send_recheck_rejects_disappeared_gap (test_fresh_fetch.FetchTests.test_send_recheck_rejects_disappeared_gap) ... ok
+test_stale_candidate_peer_future_and_small_gap_diagnostics (test_fresh_fetch.FetchTests.test_stale_candidate_peer_future_and_small_gap_diagnostics) ... ok
+test_successful_send_confirms_refreshed_entry (test_fresh_fetch.FetchTests.test_successful_send_confirms_refreshed_entry) ... ok
+test_ltp_and_ask_2_to_5pct_boundaries (test_mcx.GapTests.test_ltp_and_ask_2_to_5pct_boundaries) ... ok
+test_old_pending_alerts_suppressed_without_deleting_data (test_mcx.GapTests.test_old_pending_alerts_suppressed_without_deleting_data) ... ok
+test_sweep_records_all_and_falls_back_when_greeks_unavailable (test_mcx.IntegrationTests.test_sweep_records_all_and_falls_back_when_greeks_unavailable) ... MCX 12:00:00 sweep=1 quotes=3 valid_pricing_gap_too_small=0 blocked_stale_inputs=0
+ok
+test_telegram_queue_event_dedup (test_mcx.IntegrationTests.test_telegram_queue_event_dedup) ... ok
+test_atm_full_list_ties_and_plus_minus_four_both_sides (test_mcx.LiquidityTests.test_atm_full_list_ties_and_plus_minus_four_both_sides) ... ok
+test_atm_missing_future_does_not_pass_and_separates_groups (test_mcx.LiquidityTests.test_atm_missing_future_does_not_pass_and_separates_groups) ... ok
+test_each_liquidity_failure_and_inclusive_boundaries (test_mcx.LiquidityTests.test_each_liquidity_failure_and_inclusive_boundaries) ... ok
+test_negative_age_and_nonfinite_rejected (test_mcx.LiquidityTests.test_negative_age_and_nonfinite_rejected) ... ok
+test_recording_preserves_rejected_contracts (test_mcx.LiquidityTests.test_recording_preserves_rejected_contracts) ... ok
+test_spread_2pct_boundary_and_crossed_book (test_mcx.LiquidityTests.test_spread_2pct_boundary_and_crossed_book) ... ok
+test_api_maps_instrument_token (test_mcx.MathTests.test_api_maps_instrument_token) ... ok
+test_close_schedule (test_mcx.MathTests.test_close_schedule) ... ok
+test_discover_exact_future_nearest_expiry_all_strikes (test_mcx.MathTests.test_discover_exact_future_nearest_expiry_all_strikes) ... ok
+test_expired_skipped (test_mcx.MathTests.test_expired_skipped) ... ok
+test_greek_request_limit_and_all_keys (test_mcx.MathTests.test_greek_request_limit_and_all_keys) ... ok
+test_illiquid_peers_rejected_but_raw_data_preserved (test_mcx.MathTests.test_illiquid_peers_rejected_but_raw_data_preserved) ... ok
+test_iv_impossible_price (test_mcx.MathTests.test_iv_impossible_price) ... ok
+test_iv_roundtrip_both_sides (test_mcx.MathTests.test_iv_roundtrip_both_sides) ... ok
+test_missing_data_is_null (test_mcx.MathTests.test_missing_data_is_null) ... ok
+test_missing_underlying_never_guessed (test_mcx.MathTests.test_missing_underlying_never_guessed) ... ok
+test_parity (test_mcx.MathTests.test_parity) ... ok
+test_previous_day_still_recordable_not_model_input (test_mcx.MathTests.test_previous_day_still_recordable_not_model_input) ... ok
+test_signed_delta_and_gamma (test_mcx.MathTests.test_signed_delta_and_gamma) ... ok
+test_each_bad_peer_blocks_model_and_records_reason (test_mcx.PeerInputTests.test_each_bad_peer_blocks_model_and_records_reason) ... ok
+test_midpoints_used_instead_of_stale_price_level (test_mcx.PeerInputTests.test_midpoints_used_instead_of_stale_price_level) ... ok
+test_analyse_no_preentry_touch_and_future_touch (test_mcx.RecorderTests.test_analyse_no_preentry_touch_and_future_touch) ... ok
+test_append_restart_no_overwrite_and_export (test_mcx.RecorderTests.test_append_restart_no_overwrite_and_export) ... ok
+test_raw_depth_preserved (test_mcx.RecorderTests.test_raw_depth_preserved) ... ok
+test_dedup_and_no_stale_touch_restart (test_mcx.WatchTests.test_dedup_and_no_stale_touch_restart) ... ok
+test_report_no_later_data_not_claimed_full_coverage (test_mcx.WatchTests.test_report_no_later_data_not_claimed_full_coverage) ... ok
+
+----------------------------------------------------------------------
+Ran 39 tests in 0.083s
+
+OK

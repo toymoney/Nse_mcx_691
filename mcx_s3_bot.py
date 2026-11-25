@@ -19,6 +19,7 @@ from mcx_recorder import Recorder
 IST = ZoneInfo('Asia/Kolkata')
 MASTER_URL = 'https://assets.upstox.com/market-quote/instruments/exchange/MCX.json.gz'
 VERSION = 'MCX_S3_RESEARCH_V1'
+FETCH_VERSION = 'ATM_FIRST_REFRESH_V5'
 ALERT_POLICY = 'MCX_OPTIONS_BUY_GAP2_5_PEERMID_ATM4_V4'
 ALERT_FILTERS = {'min_gap_pct':2., 'max_gap_pct':5., 'max_spread_pct':2., 'min_oi_raw':500.,
                  'min_volume_raw':100., 'max_trade_age_seconds':30., 'max_atm_steps':4}
@@ -295,7 +296,7 @@ def liquidity_reasons(r):
 
 
 def alert_reasons(r):
-    reasons=liquidity_reasons(r)
+    reasons=liquidity_reasons(r)+r.get('input_freshness_reasons',[])
     target=number(r.get('model_target'));ltp=number(r.get('ltp'));ask=number(r.get('ask'))
     if r.get('model_status')!='computed' or not target or target<=0:
         reasons.append('model_unavailable')
@@ -314,6 +315,63 @@ def alert_reasons(r):
 
 def alert_eligible(r):
     return not alert_reasons(r)
+
+
+def annotate_from_master(rows, contracts):
+    """ATM distances always use the entire listed strike ladder, not the fetched subset."""
+    ladders=defaultdict(set)
+    for c in contracts:
+        ladders[(c['underlying_key'],iso(expiry_at(c)))].add(number(c['strike_price']))
+    for r in rows:
+        strikes=sorted(k for k in ladders[(r['underlying_key'],r['expiry_at'])] if k is not None)
+        f=number(r.get('futures_price'))
+        atm=min(strikes,key=lambda k:(abs(k-f),-k)) if strikes and f and f>0 else None
+        r['atm_strike']=atm
+        r['strike_steps_from_atm']=strikes.index(r['strike'])-strikes.index(atm) if atm is not None else None
+    return rows
+
+
+def priority_contracts(contracts, futures):
+    """Return ATM +/-4 and one listed neighbour beyond each edge, grouped by future/expiry."""
+    groups=defaultdict(list)
+    for c in contracts:groups[(c['underlying_key'],iso(expiry_at(c)))].append(c)
+    result=[]
+    for (key,_),group in sorted(groups.items()):
+        f=number((futures.get(key) or ({},None))[0].get('last_price'))
+        if not f or f<=0:continue
+        strikes=sorted({number(c['strike_price']) for c in group})
+        atm=min(range(len(strikes)),key=lambda i:(abs(strikes[i]-f),-strikes[i]))
+        chosen=set(strikes[max(0,atm-5):atm+6])
+        result.append([c for c in group if number(c['strike_price']) in chosen])
+    return result
+
+
+def freshness_reasons(r, t):
+    """Independent freshness diagnostics; a new HTTP response does not make an old trade fresh."""
+    reasons=[]
+    fields=[('candidate_trade',r.get('last_trade_at')),('candidate_quote',r.get('quote_updated_at')),
+            ('candidate_received',r.get('quote_received_at',r.get('observed_at'))),
+            ('future_trade',(r.get('future_quote_raw') or {}).get('last_trade_time')),
+            ('future_quote',(r.get('future_quote_raw') or {}).get('timestamp')),
+            ('future_received',r.get('future_observed_at'))]
+    for label,value in fields:
+        at=timestamp(value)
+        if not at or not 0<=(t-at).total_seconds()<=30:reasons.append(label+'_stale_or_unknown')
+    for check in r.get('peer_input_checks',[]):
+        if 'trade_age_above_30s_or_unknown' in check.get('reasons',[]):reasons.append('peer_trade_stale_or_unknown')
+    return sorted(set(reasons))
+
+
+def diagnostic_bucket(r):
+    if r.get('input_freshness_reasons'):return 'blocked_stale_inputs'
+    if r.get('model_status')=='computed' and not liquidity_reasons(r):
+        gaps=[number(r.get(k)) for k in ('gap_pct','ask_gap_pct')]
+        if all(g is not None for g in gaps) and min(gaps)<ALERT_FILTERS['min_gap_pct']-1e-12:
+            return 'valid_pricing_gap_too_small'
+        if all(g is not None for g in gaps) and max(gaps)>ALERT_FILTERS['max_gap_pct']+1e-12:
+            return 'valid_pricing_gap_too_large'
+        if alert_eligible(r):return 'eligible_before_refresh'
+    return 'other_input_or_liquidity_block'
 
 
 class Scanner:
@@ -350,15 +408,40 @@ class Scanner:
         pending=sorted((m for m in self.state['outbox'] if not m['sent'] and not m.get('suppressed')),
                        key=lambda m: 0 if m['id'].startswith(('report-','test-','online-')) else 1 if m['id'].startswith('hit-') else 2)
         for m in pending:
+            if m['id'].startswith('entry-') and not m.get('refresh_seed'):
+                m['suppressed']='missing_refresh_context_after_upgrade'
+                self.save();continue
             time.sleep(max(0,3.2-(time.monotonic()-self.last_send)))
             try:
+                if m['id'].startswith('entry-') and m.get('watch_id'):
+                    w=next((w for w in self.state['watches'] if w['id']==m['watch_id']),None)
+                    seed=m.get('refresh_seed')
+                    checked=self.refresh_candidate(seed) if seed else None
+                    if not checked or not alert_eligible(checked) or now()>session_close(now()):
+                        m['suppressed']='final_refresh_rejected'
+                        if w:w['status']='ENTRY_RECHECK_REJECTED'
+                        self.counts['final_refresh_rejected']+=1
+                        if checked:
+                            self.counts['diagnostic_'+diagnostic_bucket(checked)]+=1
+                        day=self.state['days'].get(now().date().isoformat())
+                        if day is not None:day['counts']=dict(self.counts)
+                        self.save();continue
+                    w.update(entered=checked['observed_at'],entry=checked['ltp'],buy_reference=checked['ask'],
+                             target=checked['model_target'],gap_pct=checked['gap_pct'],ask_gap_pct=checked['ask_gap_pct'])
+                    m['text']=self.entry_message(checked)
+                    self.counts['final_refresh_passed']+=1
                 response=requests.post('https://api.telegram.org/bot'+token+'/sendMessage',
                                        json={'chat_id':chat,'text':m['text']},timeout=20)
                 self.last_send=time.monotonic()
                 if response.status_code==429: print('Telegram rate limit; message remains queued',flush=True); return
                 if not response.ok or not response.json().get('ok'): raise RuntimeError('Telegram delivery failed; queue retained')
             except requests.RequestException: raise RuntimeError('Telegram network failure; queue retained') from None
-            m['sent']=True; self.save(); sent+=1
+            m['sent']=True
+            if m.get('watch_id'):
+                for w in self.state['watches']:
+                    if w['id']==m['watch_id']:w['entry_confirmed']=True
+            self.state['days'].get(now().date().isoformat(),{}).update(counts=dict(self.counts))
+            self.save(); sent+=1
             if sent>=5: break
 
     def prepare(self,t):
@@ -381,13 +464,13 @@ class Scanner:
         watches=[w for w in self.state['watches'] if w['day']==day]
         for w in watches:
             if w['status']=='OPEN':w['status']='NO_TOUCH_OBSERVED'
-        cohort=[w for w in watches if w.get('policy')==ALERT_POLICY]
+        cohort=[w for w in watches if w.get('policy')==ALERT_POLICY and w.get('entry_confirmed',True)]
         counts=Counter(w['status'] for w in cohort)
         report={'day':d,'watches':watches,'outcomes':dict(counts),'alert_policy':ALERT_POLICY,'new_policy_watches':len(cohort),'legacy_watches':len(watches)-len(cohort),
                 'evidence':'Same-day post-entry polled LTP only. No full-tick or complete candle coverage claimed.'}
         folder=self.root/'reports';folder.mkdir(exist_ok=True)
         (folder/(day+'.json')).write_text(json.dumps(report,indent=2))
-        text=f'MCX S3 DAILY | {day}\nSweeps {d["sweeps"]}; options {d["option_count"]}\n2–5% option watches {len(cohort)}; target observed {counts["TARGET_OBSERVED"]}; no touch observed {counts["NO_TOUCH_OBSERVED"]}.\nAll raw snapshots saved, including contracts without a model/watch.\nPolled observations; use recorded data for filter comparison.'
+        text=f'MCX S3 DAILY | {day}\nSweeps {d["sweeps"]}; options {d["option_count"]}\n2–5% option watches {len(cohort)}; target observed {counts["TARGET_OBSERVED"]}; no touch observed {counts["NO_TOUCH_OBSERVED"]}.\nAll raw snapshots saved, including contracts without a model/watch.\nPolled observations; use recorded data for filter comparison.\nValid pricing but gap too small: {d.get("counts",{}).get("diagnostic_valid_pricing_gap_too_small",0)}\nBlocked by stale inputs: {d.get("counts",{}).get("diagnostic_blocked_stale_inputs",0)}'
         (folder/(day+'.txt')).write_text(text);self.emit('report-'+day,text)
         d['reported']=True; self.save()
 
@@ -395,7 +478,7 @@ class Scanner:
         # Finish watches only from actual later trades, never stale pre-entry trades.
         latest={r['instrument_key']:r for r in rows}
         for w in self.state['watches']:
-            if w['day']!=day or w['status']!='OPEN': continue
+            if w['day']!=day or w['status']!='OPEN' or not w.get('entry_confirmed',True): continue
             r=latest.get(w['key']); trade=timestamp(r.get('last_trade_at')) if r else None
             if not r or not trade or not timestamp(w['entered'])<trade<=t or trade.date()!=t.date():continue
             if not r.get('ltp') or r['ltp']<=0:continue
@@ -404,70 +487,169 @@ class Scanner:
                 w.update(status='TARGET_OBSERVED',hit_at=r['last_trade_at'],hit_price=r['ltp'])
                 if w.get('policy')==ALERT_POLICY:
                     self.emit('hit-'+w['id'],f'🎯 TARGET REACHED | {w["symbol"]} {w["strike"]:g} {w["side"]}\nEntry ₹{price_text(w.get("buy_reference",w["entry"]))} | Target ₹{price_text(w["target"])}\nObserved price ₹{price_text(r["ltp"])}\nGap at entry {w.get("ask_gap_pct",w["gap_pct"]):.2f}%\n{r["last_trade_at"]}')
-        existing={(w['day'],w['key']) for w in self.state['watches'] if w.get('policy')==ALERT_POLICY}
+        existing={(w['day'],w['key']) for w in self.state['watches'] if w.get('policy')==ALERT_POLICY and w.get('status')!='ENTRY_RECHECK_REJECTED'}
         for r in rows:
             if not alert_eligible(r):continue
             if (day,r['instrument_key']) in existing:continue
             id_=hashlib.sha256((ALERT_POLICY+':'+day+':'+r['instrument_key']).encode()).hexdigest()[:16]
-            w={'id':id_,'policy':ALERT_POLICY,'buy_reference':r['ask'],'ask_gap_pct':r['ask_gap_pct'],'key':r['instrument_key'],'symbol':r['symbol'],'strike':r['strike'],'side':r['side'],
+            w={'id':id_,'policy':ALERT_POLICY,'entry_confirmed':not self.telegram,'buy_reference':r['ask'],'ask_gap_pct':r['ask_gap_pct'],'key':r['instrument_key'],'symbol':r['symbol'],'strike':r['strike'],'side':r['side'],
                'day':day,'entered':r['observed_at'],'entry':r['ltp'],'target':r['model_target'],'status':'OPEN',
                'gap_pct':r['gap_pct'],'atm_strike':r.get('atm_strike'),'strike_steps_from_atm':r.get('strike_steps_from_atm'),'quality_flags':r['quality_flags'],'snapshot_file':str(self.recorder.path.relative_to(self.root)),
                'last_price':r['ltp'],'last_observed_at':r['observed_at']}
-            self.state['watches'].append(w);existing.add((day,r['instrument_key']))
-            option_name='CALL' if r['side']=='CE' else 'PUT'
-            self.emit('entry-'+id_,f'🟢 BUY MCX OPTION | {r["symbol"]} {r["strike"]:g} {r["side"]} ({option_name})\nExpiry: {r["expiry_at"][:10]}\nEntry ₹{price_text(r["ask"])} | Target ₹{price_text(r["model_target"])}\nGap below model value at ask: {r["ask_gap_pct"]:.2f}%\nStop-loss: not set\n{r["observed_at"][11:19]} IST | Option premium; not a futures trade')
+            previous=next((old for old in self.state['watches'] if old['id']==id_),None)
+            if previous is None:self.state['watches'].append(w)
+            else:previous.clear();previous.update(w)
+            existing.add((day,r['instrument_key']))
+            self.emit('entry-'+id_,self.entry_message(r))
+            for m in self.state['outbox']:
+                if m['id']=='entry-'+id_+':0':
+                    if m.get('suppressed')=='final_refresh_rejected':
+                        m.pop('suppressed',None);m['sent']=False
+                    m.update(watch_id=id_,refresh_seed={'instrument_key':r['instrument_key'],
+                             'underlying_key':r['underlying_key'],'peer_keys':r['peer_keys']})
+
+    @staticmethod
+    def entry_message(r):
+        option_name='CALL' if r['side']=='CE' else 'PUT'
+        return (f'🟢 BUY MCX OPTION | {r["symbol"]} {r["strike"]:g} {r["side"]} ({option_name})\n'
+                f'Expiry: {r["expiry_at"][:10]}\nEntry ₹{price_text(r["ask"])} | Target ₹{price_text(r["model_target"])}\n'
+                f'Gap below model value at ask: {r["ask_gap_pct"]:.2f}%\nStop-loss: not set\n'
+                f'{r["observed_at"][11:19]} IST | Option premium; not a futures trade')
+
+    def build_rows(self, contracts, quotes, futures, evaluated_at, phase, broker=None):
+        rows=[]
+        for c in contracts:
+            q,at=quotes.get(c['instrument_key'],({},evaluated_at))
+            r=snapshot(c,q,at,futures.get(c['underlying_key']),(broker or {}).get(c['instrument_key']))
+            r.update(quote_received_at=iso(at),observed_at=iso(evaluated_at),evaluated_at=iso(evaluated_at),
+                     fetch_phase=phase,fetch_version=FETCH_VERSION)
+            if r.get('last_trade_at'):r['trade_age_seconds']=(evaluated_at-timestamp(r['last_trade_at'])).total_seconds()
+            rows.append(r)
+        evaluate(rows,evaluated_at,float(os.getenv('RISK_FREE_RATE','.06')))
+        annotate_from_master(rows,self.options)
+        by_key={r['instrument_key']:r for r in rows}
+        for r in rows:
+            stale=freshness_reasons(r,evaluated_at)
+            for key in r.get('peer_keys',[]):
+                peer=by_key.get(key)
+                if peer and freshness_reasons(peer,evaluated_at):stale.append('peer_quote_or_trade_stale_or_unknown')
+            r['input_freshness_reasons']=sorted(set(stale))
+            r.update(alert_policy=ALERT_POLICY)
+            r['alert_rejection_reasons']=alert_reasons(r)
+            r['alert_eligible']=not r['alert_rejection_reasons']
+        return rows
+
+    def refresh_candidate(self, seed):
+        """One REST quote request for exactly candidate + both chosen peers + exact future."""
+        contracts={c['instrument_key']:c for c in self.options}
+        peers=seed.get('peer_keys',[])
+        keys=[seed['instrument_key']]+peers+[seed['underlying_key']]
+        if len(peers)!=2 or len(set(keys))!=4 or any(k not in contracts for k in keys[:3]):return None
+        try:quotes=self.api.quotes(keys)
+        except PermissionError:raise
+        except RuntimeError as exc:
+            self.counts['refresh_request_error']+=1
+            self.recorder.write({'kind':'error','observed_at':iso(now()),'operation':'alert_refresh','keys':keys,'error':str(exc)})
+            return None
+        evaluated_at=now()
+        if any(k not in quotes for k in keys):
+            self.counts['refresh_missing_inputs']+=1
+            self.counts['diagnostic_blocked_stale_inputs']+=1
+            self.recorder.write({'kind':'error','observed_at':iso(evaluated_at),'operation':'alert_refresh',
+                                 'missing_keys':[k for k in keys if k not in quotes]})
+            return None
+        future={keys[-1]:quotes[keys[-1]]}
+        self.record_futures(future,'alert_refresh')
+        rows=self.build_rows([contracts[k] for k in keys[:3]],quotes,future,evaluated_at,'alert_refresh')
+        for r in rows:self.recorder.write(r)
+        return next(r for r in rows if r['instrument_key']==seed['instrument_key'])
+
+    def record_futures(self, futures, phase):
+        for key,(q,at) in futures.items():
+            self.recorder.write({'kind':'future','instrument_key':key,'observed_at':iso(at),
+                                 'raw_quote':q,'fetch_phase':phase,'fetch_version':FETCH_VERSION})
 
     def sweep(self,t,create_watches=True):
         d=self.prepare(t); start=time.monotonic()
         for old in list(self.state['days']):
             if old<t.date().isoformat() and not self.state['days'][old].get('reported'):self.report(old)
-        keys=[r['instrument_key'] for r in self.options]
-        futures=self.api.quotes(list(self.futures)); quotes={}; broker={}
-        for key,(q,at) in futures.items():self.recorder.write({'kind':'future','instrument_key':key,'observed_at':iso(at),'raw_quote':q})
-        # Individual batch failures are saved, not silently interpreted as zero values.
-        for i in range(0,len(keys),100):
-            batch=keys[i:i+100]
-            try:quotes.update(self.api.quotes(batch))
+        futures=self.api.quotes(list(self.futures));self.record_futures(futures,'atm_discovery')
+        priority=priority_contracts(self.options,futures)
+        priority_keys=set();all_quotes={};broker={};priority_rows=[]
+        for group in priority:
+            # <=22 option quotes + future normally fit one request. No Greeks on this path.
+            keys=[c['instrument_key'] for c in group]
+            priority_keys.update(keys)
+            try:q=self.api.quotes(keys+list({c['underlying_key'] for c in group}))
             except PermissionError:raise
             except RuntimeError as exc:
-                self.recorder.write({'kind':'error','observed_at':iso(now()),'operation':'quotes','keys':batch,'error':str(exc)})
                 self.counts['quote_batch_error']+=1
-            if self.broker_greeks_available:
-                try:broker.update(self.api.quotes(batch,greek=True))
-                except PermissionError:raise
-                except RuntimeError as exc:
-                    self.broker_greeks_available=False
-                    self.recorder.write({'kind':'error','observed_at':iso(now()),'operation':'greeks','error':str(exc)})
-                    print('Broker Greeks endpoint unavailable; raw quotes + local Black76 Greeks continue',flush=True)
-        evaluated_at=now(); rows=[]
-        d['last_quote_count']=len(quotes)
-        d['last_broker_greeks_count']=len(broker)
-        d['last_missing_quote_count']=len(keys)-len(quotes)
-        if not quotes:
-            print('MCX: no option quotes returned; inspect broker entitlement/instrument keys',flush=True)
-        for contract in self.options:
-            q,at=quotes.get(contract['instrument_key'],({},evaluated_at))
-            r=snapshot(contract,q,at,futures.get(contract['underlying_key']),broker.get(contract['instrument_key']))
-            r['quote_received_at']=r['observed_at']
-            r['observed_at']=iso(evaluated_at)
-            if r.get('last_trade_at'):
-                r['trade_age_seconds']=(evaluated_at-timestamp(r['last_trade_at'])).total_seconds()
-            r['evaluated_at']=iso(evaluated_at)
-            rows.append(r)
-        evaluate(rows,evaluated_at,float(os.getenv('RISK_FREE_RATE','.06')))
-        annotate_atm(rows)
-        for r in rows:
-            r['alert_policy']=ALERT_POLICY
-            r['alert_rejection_reasons']=alert_reasons(r)
-            r['alert_eligible']=not r['alert_rejection_reasons']
-            for reason in r['alert_rejection_reasons']:self.counts['alert_reject_'+reason]+=1
-            self.recorder.write(r)
-            self.counts[r['model_status']]+=1
-        d.update(sweeps=d['sweeps']+1,last_sweep_at=iso(evaluated_at),last_sweep_seconds=round(time.monotonic()-start,2),counts=dict(self.counts))
-        # Do not produce post-close watches/hits from a request completing late.
-        if create_watches and evaluated_at<=session_close(evaluated_at): self.process(rows,evaluated_at,d['date'])
+                self.recorder.write({'kind':'error','observed_at':iso(now()),'operation':'priority_quotes','keys':keys,'error':str(exc)})
+                continue
+            fresh_futures={k:q[k] for k in self.futures if k in q}
+            self.record_futures(fresh_futures,'atm_priority')
+            all_quotes.update({k:q[k] for k in keys if k in q})
+            at=now();rows=self.build_rows(group,q,fresh_futures,at,'atm_priority')
+            priority_rows.extend(rows)
+            for r in rows:
+                self.recorder.write(r)
+                self.counts[r['model_status']]+=1
+                steps=r.get('strike_steps_from_atm')
+                if steps is not None and abs(steps)<=4:
+                    self.counts['diagnostic_'+diagnostic_bucket(r)]+=1
+                    for reason in r['alert_rejection_reasons']:self.counts['alert_reject_'+reason]+=1
+            if create_watches and at<=session_close(at):
+                # Verify all four instruments, then process and deliver before background work.
+                verified=[]
+                existing={(w['day'],w['key']) for w in self.state['watches'] if w.get('policy')==ALERT_POLICY and w.get('status')!='ENTRY_RECHECK_REJECTED'}
+                for r in rows:
+                    if alert_eligible(r) and (d['date'],r['instrument_key']) not in existing:
+                        checked=self.refresh_candidate(r)
+                        if checked:
+                            verified.append(checked)
+                            if not alert_eligible(checked):self.counts['diagnostic_'+diagnostic_bucket(checked)]+=1
+                # Ordinary observations may finish watches; only verified rows can start one.
+                observations=[dict(r,alert_eligible=False) for r in rows]
+                for r in observations:r['input_freshness_reasons']=r.get('input_freshness_reasons',[])+['entry_requires_refresh']
+                self.process(observations+verified,now(),d['date'])
+                if self.telegram:self.flush()
+        # Preserve all-strike research coverage after the time-critical alert path.
+        background=[c for c in self.options if c['instrument_key'] not in priority_keys]
+        for i in range(0,len(background),100):
+            group=background[i:i+100];keys=[c['instrument_key'] for c in group]
+            try:q=self.api.quotes(keys)
+            except PermissionError:raise
+            except RuntimeError as exc:
+                self.counts['quote_batch_error']+=1;q={}
+                self.recorder.write({'kind':'error','observed_at':iso(now()),'operation':'background_quotes','keys':keys,'error':str(exc)})
+            all_quotes.update(q)
+            rows=self.build_rows(group,q,futures,now(),'background_recording')
+            for r in rows:
+                self.recorder.write(r);self.counts[r['model_status']]+=1
+            if create_watches:
+                for r in rows:r['input_freshness_reasons'].append('entry_requires_refresh')
+                self.process(rows,now(),d['date']) if now()<=session_close(now()) else None
+        # Broker Greeks are supplementary; do not delay premium quotes or alerts for them.
+        if self.broker_greeks_available:
+            keys=list(all_quotes)
+            try:
+                broker=self.api.quotes(keys,greek=True)
+                for key,(value,at) in broker.items():
+                    self.recorder.write({'kind':'broker_greeks','instrument_key':key,'observed_at':iso(at),'broker_greeks':value,
+                                         'fetch_phase':'supplementary_greeks','fetch_version':FETCH_VERSION})
+            except PermissionError:raise
+            except RuntimeError:
+                self.broker_greeks_available=False
+                self.counts['broker_greeks_unavailable']+=1
+        at=now()
+        d.update(sweeps=d['sweeps']+1,last_sweep_at=iso(at),last_sweep_seconds=round(time.monotonic()-start,2),
+                 counts=dict(self.counts),fetch_version=FETCH_VERSION,last_quote_count=len(all_quotes),
+                 last_broker_greeks_count=len(broker),last_missing_quote_count=len(self.options)-len(all_quotes),
+                 priority_option_count=len(priority_keys))
         self.save()
-        print(f'MCX {evaluated_at:%H:%M:%S} sweep={d["sweeps"]} snapshots={len(rows)} computed={sum(r["model_status"]=="computed" for r in rows)} pending={sum(not m["sent"] and not m.get("suppressed") for m in self.state["outbox"])}',flush=True)
+        print(f'MCX {at:%H:%M:%S} sweep={d["sweeps"]} quotes={len(all_quotes)} '
+              f'valid_pricing_gap_too_small={self.counts["diagnostic_valid_pricing_gap_too_small"]} '
+              f'blocked_stale_inputs={self.counts["diagnostic_blocked_stale_inputs"]}',flush=True)
 
     def checkpoint(self):
         self.recorder.close();self.save()
