@@ -1,33 +1,56 @@
-# MCX S3 v4 — option buying + complete research recording
+# MCX Option Gap Scanner (BUY side only, Upstox data API)
 
-This package updates the existing MCX scanner. It does not change NSE files or place orders.
+Finds MCX options that trade **cheap versus fair value**, so you can buy low and sell when price returns to fair.
+Read-only: it never places orders.
 
-## Update your existing repository
+## Run
+```sh
+pip install -r requirements.txt
+python mcx_gap_scanner.py --demo --chain CRUDEOIL   # offline, no token: see the alert format first
+cp .env.example .env                                  # paste your Upstox Analytics Token
+python mcx_gap_scanner.py --test                      # checks token, MCX master, a quote, Telegram
+python mcx_gap_scanner.py --once --chain CRUDEOIL     # one pass + full fair-value table for Crude
+python mcx_gap_scanner.py                             # live loop every 60 s during MCX hours
+python -m unittest discover -s tests -v
+```
+Alerts print on screen, go to Telegram if configured, and are appended to `state/signals.csv`.
 
-1. Stop any active MCX scanner job.
-2. Extract the ZIP. Replace these exact paths on your repository's default branch:
-   - `mcx_s3_bot.py`
-   - `mcx_recorder.py`
-   - `tests/test_mcx.py` (inside the tests folder)
-   - `README.md`
-3. Commit them together. The corrected tests must be uploaded with the scanner.
-4. Open Actions > MCX S3 scanner and recorder > Run workflow > mode `run`.
+## Important: Upstox has no option chain for MCX
+Upstox's Put/Call Option Chain API states it is **not available for the MCX exchange**. So this tool builds the chain
+itself from the public MCX instrument master (`MCX.json.gz`) plus Full Market Quotes (LTP, best bid/ask, OI, volume).
+It auto-discovers every MCX option underlying (Crude, Gold, Silver, Natural Gas, Copper, Zinc ...), no hard-coded list.
 
-The existing workflow and all three secrets are unchanged. This ZIP also includes the workflow and requirements for a fresh installation. Do not delete `mcx-research-state` or any existing recordings. The ZIP is a replacement package for you to upload; the connected GitHub repository was only read while preparing it.
+## Expiry rule
+Monthly series only. Uses the nearest expiry with **more than `ROLL_DAYS` (5) calendar days left**; with 5 or fewer days
+it moves to the next expiry. Set `INCLUDE_WEEKLY=true` for weekly series.
 
-## Live-alert rules — v4
+## Fair value ("one value per option")
+Two independent old-school models, averaged:
+1. **Put-call parity**: `C - P = e^(-rT) (F - K)`. Fair CE comes from the PE at the same strike and vice versa. Needs no volatility.
+2. **Black-76** (MCX options are on futures) with volatility interpolated from the **neighbouring strikes**, never the option's own price.
 
-- Buy CE or PE only, ATM ±4 actual listed strike steps.
-- Both LTP and available ask must be 2% to 5% below the calculated target, inclusive.
-- Candidate and BOTH immediately bracketing usable same-side IV neighbours: OI >=500, volume >=100 (broker raw units), spread <=2%, trade age 0–30 seconds, positive bid/ask quantities, uncrossed book.
-- A failed neighbour blocks the target; the model does not skip to a farther liquid strike.
-- Target IV is interpolated from neighbouring bid–ask midpoint IV, not neighbouring LTP IV. Own IV/Greeks remain recorded from own LTP.
-- Targets remain calculated Black-76 values, fixed at alert entry. No delta, IV ceiling or directional rule was added.
-- Gap means `(target-price)/target*100`; it is not profit divided by entry. Target 100 permits price 95 through 98.
-- All raw snapshots, broker Greeks, own Greeks, OI, volume, book and rejection reasons remain recorded. `peer_input_checks` adds each peer midpoint, midpoint IV and failed checks.
+A signal needs **both** models to agree it is cheap (`MIN_MODELS=2`). Greeks (delta, theta, vega) come from our own Black-76;
+OI and spread weight the smile and filter illiquid strikes; Upstox's option-greek IV is shown as a cross-check when it returns MCX data.
 
-Replace mcx_s3_bot.py, tests/test_mcx.py and README.md together. Included recorder, requirements and workflow support a complete replacement installation. Existing recordings and mcx-research-state must be retained. This ZIP is prepared for upload; it is not deployed to GitHub.
+## How big should the gap be? (1-2% is too small)
+I searched for a published standard and did **not** find a blog or forum that gives a "1-2%" rule. What the sources I found say:
+mispricing must exceed transaction costs by a margin before trading (arXiv "Optimal Convergence Trading"), and professional
+tools such as ORATS express edge as a percentage of the mid price. So the threshold here is derived from your real costs:
 
-After replacement, stop the old active MCX run and start the MCX workflow in run mode. A running job keeps its previously checked-out code until restarted. Secrets and the recording locations are unchanged: mcx-research-state/snapshots/YYYY-MM-DD and reports/. Older watches remain recorded separately; pending old-policy entry/target messages are suppressed.
+* **Gap vs LTP >= 10%** (`MIN_GAP_PCT`): `(fair - LTP) / LTP`. Your example: 500 vs 550 = 10%.
+* **Net edge >= 4% after costs** (`MIN_NET_EDGE_PCT`): `fair - ask - half the bid/ask spread - brokerage/charges`, because you buy at the *ask*, not the LTP.
+* **At least Rs 300 per lot** (`MIN_NET_EDGE_RS_LOT`), so tiny premiums do not trigger.
+* Ignores options with spread above 10%, OI/volume too low, delta outside 0.10-0.95, or a **stale LTP** (LTP outside bid/ask; mid is used instead).
 
-Validation: 30 tests passed, including inclusive 2%/5% limits, midpoint pricing, both-peer liquidity/freshness rejection, full recording, deduplication and later-trade-only target checks. These are implementation checks, not a replay result for the revised strategy.
+A 1-2% gap would usually be eaten by the spread alone. These numbers are starting defaults, not validated: watch a few
+days with `--chain`, then tune. Charges are assumptions (Rs 20/order, 0.15% other); verify on Upstox's charges page.
+
+## Exits (buy low, sell high)
+At alert time fair value is frozen as the **target**. A later "SELL / TARGET REACHED" alert fires when the bid reaches it.
+Optional `STOP_LOSS_PCT` (off by default, you did not ask for one). Unreached signals drop after 24 h or at expiry.
+
+## Honest limits
+* **Not tested against live Upstox.** I had no token. Logic is tested offline (12 tests, synthetic chain in Upstox's raw format). Field names in the MCX master (`underlying_key`, `underlying_symbol`, `weekly`, `expiry` in ms) follow Upstox's docs; run `--test` first.
+* A "cheap vs model" option can be cheap for a reason (news, skew, thin market). It is a screening alert, not a guaranteed profit; the gap can also stay open or widen. Mind slippage and lot size.
+* Fair value is an estimate; risk-free rate (6%) and expiry time (23:30 IST) are assumptions. Exchange holidays are not modelled; MCX evening-session hours vary (default 09:00-23:55).
+* Analytics Token is valid one year and read-only; generate it in Upstox Developer Apps.

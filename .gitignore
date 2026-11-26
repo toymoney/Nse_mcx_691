@@ -1,5 +1,3 @@
-__pycache__/
-*.pyc
-.mcx-state/
-mcx-state/
 .env
+state/
+__pycache__/
